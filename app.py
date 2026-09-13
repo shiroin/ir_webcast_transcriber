@@ -12,9 +12,9 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="IR Webcast Transcriber v8", page_icon="🎧", layout="centered")
-st.title("🎧 IR Webcast Transcriber v8")
-st.caption("YouTube / MP3 / M3U8 / TS / IR webcastページ。英語・中国語・韓国語・日本語に対応。企業名・決算期・説明会日もタグ付けできます。")
+st.set_page_config(page_title="IR Webcast Transcriber v9", page_icon="🎧", layout="centered")
+st.title("🎧 IR Webcast Transcriber v9")
+st.caption("YouTube / MP3 / M3U8 / TS / IR webcastページ。英語・中国語・韓国語・日本語に対応。Streamlit Cloud向け省メモリ版。")
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36"
 
@@ -260,12 +260,18 @@ def discover_media(page_url):
     return sorted(unique, key=score)
 
 
-@st.cache_resource(show_spinner=False)
 def load_model(size):
-    # Lazy import: Streamlit Cloud startup is more stable if the heavy Whisper stack
-    # is imported only when transcription actually begins.
+    # Cloud-safe: do NOT cache the Whisper model in RAM.
+    # Streamlit Community Cloud has limited memory, and cached small/medium models
+    # can cause the worker process to be killed with the generic "Oh no" page.
     from faster_whisper import WhisperModel
-    return WhisperModel(size, device="cpu", compute_type="int8")
+    return WhisperModel(
+        size,
+        device="cpu",
+        compute_type="int8",
+        cpu_threads=2,
+        num_workers=1,
+    )
 
 
 def fmt_time(seconds):
@@ -318,6 +324,15 @@ def transcribe(audio_path, size, language, timestamps, progress_bar=None, progre
     if progress_text is not None:
         progress_text.caption(f"文字起こし 100%  |  {fmt_time(duration)} / {fmt_time(duration)}")
 
+    # Release model memory as soon as transcription finishes.
+    try:
+        del segments
+        del model
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+
     return "\n".join(lines).strip() + "\n"
 
 
@@ -363,9 +378,9 @@ c1, c2 = st.columns(2)
 with c1:
     model_size = st.selectbox(
         "Whisper",
-        ["small", "medium", "large-v3"],
-        index=0,
-        help="Intel Macでは small 推奨",
+        ["tiny", "base", "small"],
+        index=1,
+        help="Streamlit Cloudでは base 推奨。small はメモリ不足で落ちる場合があります。",
     )
 with c2:
     language = st.selectbox(
