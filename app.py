@@ -11,11 +11,10 @@ from urllib.parse import urljoin, urlparse
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from faster_whisper import WhisperModel
 
-st.set_page_config(page_title="IR Webcast Transcriber v7", page_icon="🎧", layout="centered")
-st.title("🎧 IR Webcast Transcriber v7")
-st.caption("YouTube / MP3 / M3U8 / IR webcastページ。英語・中国語・韓国語・日本語に対応。企業名・決算期・説明会日もタグ付けできます。")
+st.set_page_config(page_title="IR Webcast Transcriber v8", page_icon="🎧", layout="centered")
+st.title("🎧 IR Webcast Transcriber v8")
+st.caption("YouTube / MP3 / M3U8 / TS / IR webcastページ。英語・中国語・韓国語・日本語に対応。企業名・決算期・説明会日もタグ付けできます。")
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36"
 
@@ -36,6 +35,8 @@ def kind(url):
     path = urlparse(url).path.lower()
     if path.endswith(".m3u8"):
         return "m3u8"
+    if path.endswith(".ts"):
+        return "ts"
     if path.endswith((".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac")):
         return "audio"
     if path.endswith((".mp4", ".webm", ".mov", ".mkv")):
@@ -100,6 +101,118 @@ def youtube_get(url, out_path):
     return candidates[0]
 
 
+
+def looks_like_m3u8_response(r):
+    if r.status_code >= 400:
+        return False
+    ct = (r.headers.get("content-type") or "").lower()
+    head = (r.text[:200] if hasattr(r, "text") else "")
+    return "mpegurl" in ct or head.lstrip().startswith("#EXTM3U")
+
+
+def infer_m3u8_candidates_from_ts(ts_url):
+    """Generate likely sibling playlist URLs from a .ts segment URL."""
+    parsed = urlparse(ts_url)
+    path = parsed.path
+    directory, filename = path.rsplit("/", 1) if "/" in path else ("", path)
+
+    names = []
+    # Exact extension swap.
+    names.append(re.sub(r"\.ts$", ".m3u8", filename, flags=re.I))
+
+    # Common HLS segment naming patterns, e.g. *_audio_part1.ts.
+    stem = re.sub(r"\.ts$", "", filename, flags=re.I)
+    patterns = [
+        (r"_part\d+$", ""),
+        (r"_seg(?:ment)?[_-]?\d+$", ""),
+        (r"[_-]\d+$", ""),
+    ]
+    bases = [stem]
+    for pat, repl in patterns:
+        b = re.sub(pat, repl, stem, flags=re.I)
+        if b != stem:
+            bases.append(b)
+    for b in bases:
+        names.extend([f"{b}.m3u8", f"{b}_playlist.m3u8", f"{b}_index.m3u8"])
+
+    # Sometimes the playlist omits an explicit "_audio" suffix.
+    for b in list(bases):
+        b2 = re.sub(r"_audio$", "", b, flags=re.I)
+        if b2 != b:
+            names.extend([f"{b2}.m3u8", f"{b2}_audio.m3u8"])
+
+    out = []
+    for name in names:
+        new_path = (directory + "/" + name) if directory else name
+        candidate = parsed._replace(path=new_path).geturl()
+        if candidate not in out:
+            out.append(candidate)
+    return out
+
+
+def find_parent_m3u8_from_ts(ts_url):
+    """Probe likely sibling playlist URLs and return the first valid M3U8."""
+    headers = {"User-Agent": UA, "Referer": ts_url}
+    for candidate in infer_m3u8_candidates_from_ts(ts_url):
+        try:
+            r = requests.get(candidate, headers=headers, timeout=8)
+            if looks_like_m3u8_response(r):
+                return candidate
+        except requests.RequestException:
+            pass
+    return None
+
+
+def ts_sequence_get(first_ts_url, out_path, progress_text=None):
+    """Fallback for *_part1.ts style streams: fetch sequential TS segments and merge."""
+    m = re.search(r"^(.*?)(\d+)(\.ts(?:\?.*)?)$", first_ts_url, re.I)
+    if not m:
+        raise RuntimeError("TS断片URLから連番パターンを判定できませんでした。m3u8 URLを貼ってください。")
+
+    prefix, start_num, suffix = m.group(1), int(m.group(2)), m.group(3)
+    # Avoid query-string confusion when constructing numbered siblings.
+    if "?" in suffix:
+        ext, query = suffix.split("?", 1)
+        tail = ext + "?" + query
+    else:
+        tail = suffix
+
+    headers = {"User-Agent": UA, "Referer": first_ts_url}
+    combined = out_path.with_suffix(".combined.ts")
+    count = 0
+    misses = 0
+    max_segments = 3000
+
+    with open(combined, "wb") as wf:
+        for n in range(start_num, start_num + max_segments):
+            seg_url = f"{prefix}{n}{tail}"
+            try:
+                r = requests.get(seg_url, headers=headers, timeout=15)
+            except requests.RequestException:
+                r = None
+
+            if r is None or r.status_code >= 400 or not r.content:
+                misses += 1
+                if count > 0 and misses >= 2:
+                    break
+                continue
+
+            misses = 0
+            wf.write(r.content)
+            count += 1
+            if progress_text is not None:
+                progress_text.caption(f"TS断片を取得中… {count} ファイル")
+
+    if count == 0:
+        raise RuntimeError("TS断片を1つも取得できませんでした。")
+
+    ffmpeg_get(str(combined), out_path)
+    try:
+        combined.unlink()
+    except OSError:
+        pass
+    return out_path, count
+
 def discover_media(page_url):
     r = requests.get(page_url, headers={"User-Agent": UA}, timeout=25)
     r.raise_for_status()
@@ -149,6 +262,9 @@ def discover_media(page_url):
 
 @st.cache_resource(show_spinner=False)
 def load_model(size):
+    # Lazy import: Streamlit Cloud startup is more stable if the heavy Whisper stack
+    # is imported only when transcription actually begins.
+    from faster_whisper import WhisperModel
     return WhisperModel(size, device="cpu", compute_type="int8")
 
 
@@ -214,7 +330,7 @@ def safe_filename(text):
 
 url = st.text_input(
     "URL",
-    placeholder="YouTube / .mp3 / .m3u8 / Chorus Call / teletogether 等",
+    placeholder="YouTube / .mp3 / .m3u8 / .ts / Chorus Call / teletogether 等",
 )
 
 st.subheader("決算説明会タグ")
@@ -297,6 +413,22 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
                 status.info("YouTubeから音声取得中…")
                 audio = youtube_get(url, audio)
                 source = "YouTube"
+
+            elif source_kind == "ts":
+                status.info("TS断片URLを検出。親のM3U8を探索中…")
+                parent = find_parent_m3u8_from_ts(url)
+                if parent:
+                    st.success("親のM3U8を自動検出しました。")
+                    st.code(parent)
+                    status.info("M3U8から音声取得中…")
+                    audio = ffmpeg_get(parent, audio)
+                    source = "TS → M3U8"
+                else:
+                    status.info("親M3U8が見つからないため、TS連番を直接取得して結合します…")
+                    ts_progress = st.empty()
+                    audio, seg_count = ts_sequence_get(url, audio, progress_text=ts_progress)
+                    ts_progress.caption(f"TS断片の取得完了: {seg_count} ファイル")
+                    source = f"TS連番 ({seg_count} segments)"
 
             elif source_kind:
                 status.info("音声取得中…")
@@ -398,10 +530,11 @@ with st.expander("対応URL"):
 - **YouTube**: `youtube.com/watch...` / `youtu.be/...`
 - **直接音声**: `.mp3`, `.m4a`, `.aac`, `.wav`
 - **M3U8**
+- **TS断片**: `.ts` を貼ると親M3U8を自動探索し、見つからなければ連番TSの直接結合を試行
 - **動画**: `.mp4`, `.webm`
 - **IR webcastページ**: HTML内のメディアURLを自動探索
 
-v5ではYouTube取得時に `yt-dlp` コマンドを直接呼ばず、
+YouTube取得時に `yt-dlp` コマンドを直接呼ばず、
 **このアプリを動かしているPythonで `python -m yt_dlp` を実行**します。
 そのため、PATH違いによる `No such file or directory: 'yt-dlp'` を避けられます。
 """)
