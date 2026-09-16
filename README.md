@@ -1,32 +1,28 @@
-# IR Webcast Transcriber v10 — External API Edition
+# IR Webcast Transcriber v11 — IR Webcasting対応
 
-Streamlit Cloud上ではローカルWhisperモデルを動かさず、音声取得のみを行い、文字起こしはOpenAIの音声文字起こしAPIへ送る省メモリ版です。
+Streamlit Cloud向けのIR決算説明会文字起こしアプリです。音声取得はffmpeg、文字起こしはOpenAI Audio Transcriptions APIを利用するため、Cloud上でWhisperモデルをロードしません。
 
-## 対応
-- YouTube
-- MP3 / M4A / AAC / WAV
-- M3U8
-- TS断片（親M3U8を自動探索。見つからなければ連番TS結合を試行）
-- MP4 / WebM
-- HTML内にメディアURLが見えるIR webcastページ
-- 英語 / 中国語 / 韓国語 / 日本語 / 自動判定
-- 企業名 / 決算期 / 説明会日 / 種別タグ
-- TXT / MP3ダウンロード
+## v11追加
+- `irwebcasting.com` のページURLをそのまま入力可能
+- IR WebcastingページのHTML・inline script・参照JS/プレイヤー設定から m3u8 / mp4 / mp3 等を探索
+- IR Webcastingページから企業名・決算期・説明会日を自動入力（取得できる場合）
+- 従来の YouTube / m3u8 / TS / MP3 / MP4 / 一般IRページも継続対応
 
-## Streamlit Community Cloudへのデプロイ
-1. GitHubリポジトリ直下に `app.py`, `requirements.txt`, `packages.txt`, `README.md` を置く。
-2. Streamlit Community Cloudで `app.py` を指定してデプロイ。
-3. Python 3.11推奨。
-4. App settings → Secrets に次を設定：
+例:
+`https://www.irwebcasting.com/20260814/1/440f7327b9/mov/main/index.html`
+
+このページではページ情報から「GMOペイメントゲートウェイ株式会社」「2026年9月期 第3四半期」「2026-08-14」の取得を試みます。
+
+## Streamlit Community Cloud
+1. ZIP内の `app.py`, `requirements.txt`, `packages.txt`, `README.md` をGitHubリポジトリ直下へ上書き
+2. Streamlit CloudはPython 3.11を選択
+3. App settings → Secrets に以下を設定
 
 ```toml
 OPENAI_API_KEY = "sk-..."
 ```
 
-APIキーをGitHubへ直接書かないでください。
+4. Reboot app
 
-## 文字起こし方式
-音声は12分ごとに、mono / 16kHz / 32kbps のMP3へ分割してAPIへ逐次送信します。Streamlitプロセス内にWhisperモデルを保持しないため、RAM使用量を大幅に抑えます。
-
-## requirements
-`faster-whisper` は不要です。
+## 注意
+IR配信サイトの実装は変更される場合があります。Cookie/認証/DRMやJavaScriptで実行時にのみ生成される署名URLの場合、自動取得できないことがあります。その場合はDevTools Networkからm3u8/mp4等を直接入力してください。

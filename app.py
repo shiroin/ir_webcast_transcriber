@@ -12,9 +12,9 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="IR Webcast Transcriber v10", page_icon="🎧", layout="centered")
-st.title("🎧 IR Webcast Transcriber v10")
-st.caption("音声取得はStreamlit、文字起こしは外部API。YouTube / MP3 / M3U8 / TS / IR webcastページ、英・中・韓・日に対応。")
+st.set_page_config(page_title="IR Webcast Transcriber v11", page_icon="🎧", layout="centered")
+st.title("🎧 IR Webcast Transcriber v11")
+st.caption("音声取得はStreamlit、文字起こしは外部API。YouTube / MP3 / M3U8 / TS / IR webcastページ / IR Webcasting、英・中・韓・日に対応。")
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36"
 OPENAI_TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions"
@@ -158,7 +158,109 @@ def ts_sequence_get(first_ts_url, out_path, progress_text=None):
     return out_path, count
 
 
+def is_irwebcasting(url):
+    return "irwebcasting.com" in urlparse(url).netloc.lower()
+
+
+def extract_irwebcasting_metadata(page_url):
+    """Best-effort extraction of company / period / event date from IR Webcasting HTML."""
+    r = requests.get(page_url, headers={"User-Agent": UA}, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    text = "\n".join(x.strip() for x in soup.stripped_strings if x.strip())
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    company = ""
+    period = ""
+    event_date = ""
+    # Company often appears first in the page title/body.
+    if title:
+        company = re.split(r"\s{2,}|\s+-\s+", title)[0].strip()
+        company = re.sub(r"\s+(?:20\d{2}年|FY20\d{2}).*$", "", company).strip()
+    if not company:
+        for line in text.splitlines()[:10]:
+            if any(k in line for k in ("株式会社", "Inc.", "Corporation", "Limited", "Ltd.")):
+                company = line.strip(); break
+    # Typical Japanese title: 2026年9月期 第3四半期 決算説明会
+    m = re.search(r"(20\d{2}年\d{1,2}月期\s*(?:第?\s*[1-4１-４]四半期|通期|上期|下期)?)", text)
+    if m:
+        period = re.sub(r"\s+", " ", m.group(1)).strip()
+    else:
+        m = re.search(r"(FY\s*20\d{2}\s*(?:Q[1-4]|[1-4]Q)?)", text, re.I)
+        if m: period = re.sub(r"\s+", " ", m.group(1)).strip()
+    m = re.search(r"(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日", text)
+    if m:
+        event_date = f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    return {"company": company, "period": period, "date": event_date}
+
+
+def _media_urls_from_text(text, base_url):
+    text = (text or "").replace("\\/", "/")
+    found = []
+    # absolute and protocol-relative media URLs
+    abs_re = re.compile(r'(?:(?:https?:)?//)[^\s"\'<>\\]+?\.(?:m3u8|mp3|m4a|aac|mp4|webm|mov)(?:\?[^\s"\'<>\\]*)?', re.I)
+    for x in abs_re.findall(text):
+        if x.startswith("//"):
+            x = urlparse(base_url).scheme + ":" + x
+        found.append(x.replace("&amp;", "&"))
+    rel_re = re.compile(r'["\']([^"\']+\.(?:m3u8|mp3|m4a|aac|mp4|webm|mov)(?:\?[^"\']*)?)["\']', re.I)
+    found += [urljoin(base_url, x.replace("&amp;", "&")) for x in rel_re.findall(text)]
+    return found
+
+
+def discover_irwebcasting_media(page_url):
+    """IR Webcasting-specific discovery: HTML + referenced same-site JS/config files."""
+    headers = {"User-Agent": UA, "Referer": page_url}
+    r = requests.get(page_url, headers=headers, timeout=25)
+    r.raise_for_status()
+    html = r.text
+    soup = BeautifulSoup(html, "html.parser")
+    found = _media_urls_from_text(html, page_url)
+
+    # Inspect inline scripts plus external JS/config files. Many IR Webcasting pages
+    # keep the movie path in player configuration rather than a visible <video> tag.
+    assets = []
+    for tag in soup.find_all("script"):
+        src = tag.get("src")
+        if src:
+            assets.append(urljoin(page_url, src))
+        else:
+            found += _media_urls_from_text(tag.get_text(" ", strip=False), page_url)
+    for tag in soup.find_all(["iframe", "source", "video", "audio", "a"]):
+        for attr in ("src", "href", "data-src", "data-url", "data-file", "data-movie"):
+            v = tag.get(attr)
+            if v:
+                full = urljoin(page_url, v)
+                if kind(full): found.append(full)
+                elif "irwebcasting" in urlparse(full).netloc.lower(): assets.append(full)
+
+    # Keep crawling deliberately shallow to avoid scraping the whole site.
+    seen_assets = set()
+    for asset in assets[:30]:
+        if asset in seen_assets: continue
+        seen_assets.add(asset)
+        try:
+            rr = requests.get(asset, headers=headers, timeout=12)
+            if rr.status_code < 400 and len(rr.content) < 5_000_000:
+                found += _media_urls_from_text(rr.text, asset)
+        except requests.RequestException:
+            pass
+
+    unique=[]
+    for x in found:
+        if x not in unique: unique.append(x)
+    def score(x):
+        lx=x.lower()
+        if ".m3u8" in lx: return 0
+        if re.search(r"\.(mp3|m4a|aac)", lx): return 1
+        return 2
+    return sorted(unique, key=score)
+
+
 def discover_media(page_url):
+    if is_irwebcasting(page_url):
+        special = discover_irwebcasting_media(page_url)
+        if special:
+            return special
     r = requests.get(page_url, headers={"User-Agent": UA}, timeout=25)
     r.raise_for_status()
     html = r.text.replace("\\/", "/")
@@ -284,17 +386,25 @@ def safe_filename(text):
     return text[:80] or "untagged"
 
 
-url = st.text_input("URL", placeholder="YouTube / .mp3 / .m3u8 / .ts / Chorus Call / teletogether 等")
+url = st.text_input("URL", placeholder="YouTube / .mp3 / .m3u8 / .ts / IR Webcasting / Chorus Call / teletogether 等")
+
+auto_meta = {"company":"", "period":"", "date":""}
+if url.strip() and is_irwebcasting(url.strip()):
+    try:
+        auto_meta = extract_irwebcasting_metadata(url.strip())
+        st.caption("IR Webcastingを検出：企業名・決算期・説明会日を自動取得します。")
+    except Exception as e:
+        st.caption(f"IR Webcastingのタグ自動取得に失敗しました（手入力は可能です）: {e}")
 
 st.subheader("決算説明会タグ")
 m1, m2 = st.columns(2)
 with m1:
-    company = st.text_input("企業名", placeholder="例: NVIDIA / SK hynix / Palantir")
+    company = st.text_input("企業名", value=auto_meta.get("company", ""), placeholder="例: NVIDIA / SK hynix / Palantir")
 with m2:
-    earnings_period = st.text_input("決算期", placeholder="例: FY2027 Q2 / 2026年2Q")
+    earnings_period = st.text_input("決算期", value=auto_meta.get("period", ""), placeholder="例: FY2027 Q2 / 2026年2Q")
 m3, m4 = st.columns(2)
 with m3:
-    earnings_date = st.text_input("説明会日", placeholder="例: 2026-08-26")
+    earnings_date = st.text_input("説明会日", value=auto_meta.get("date", ""), placeholder="例: 2026-08-26")
 with m4:
     event_type = st.selectbox("種別", ["決算説明会", "決算発表", "Investor Day", "その他"], index=0)
 
@@ -385,7 +495,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
                 audio = ffmpeg_get(url, audio)
                 source = source_kind.upper()
             else:
-                status.info("IRページ内の音声URLを探索中…")
+                status.info("IR Webcasting / IRページ内の音声URLを探索中…")
                 candidates = discover_media(url)
                 if not candidates:
                     st.error("自動検出できませんでした。JavaScript / Cookie / 認証型の可能性があります。")
@@ -455,8 +565,10 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
         st.error("処理に失敗しました。")
         st.code(str(e))
 
-with st.expander("v10のポイント"):
+with st.expander("v11のポイント"):
     st.markdown("""
+- **IR Webcasting (`irwebcasting.com`) 専用解析**を追加。HTMLだけでなくプレイヤー設定・参照JS内のメディアURLも探索します。
+- IR Webcastingでは **企業名・決算期・説明会日を自動入力**します。
 - Streamlit Cloud上では **Whisperモデルを一切ロードしません**。
 - 取得した音声を12分ごとの軽量MP3に分割し、1本ずつ文字起こしAPIへ送信します。
 - そのため、v8/v9で問題になったローカルWhisperのRAM使用量を大幅に減らせます。
