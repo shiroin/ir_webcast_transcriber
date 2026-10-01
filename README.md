@@ -1,28 +1,14 @@
-# IR Webcast Transcriber v11 — IR Webcasting対応
+# IR Webcast Transcriber v15
 
-Streamlit Cloud向けのIR決算説明会文字起こしアプリです。音声取得はffmpeg、文字起こしはOpenAI Audio Transcriptions APIを利用するため、Cloud上でWhisperモデルをロードしません。
+v14 + Q4 Events の字幕HLS (`captions/.../subtitles.m3u8`) 対応。
 
-## v11追加
-- `irwebcasting.com` のページURLをそのまま入力可能
-- IR WebcastingページのHTML・inline script・参照JS/プレイヤー設定から m3u8 / mp4 / mp3 等を探索
-- IR Webcastingページから企業名・決算期・説明会日を自動入力（取得できる場合）
-- 従来の YouTube / m3u8 / TS / MP3 / MP4 / 一般IRページも継続対応
+## v15 修正点
+- `subtitles.m3u8` / `/captions/` を音声M3U8として ffmpeg に渡さない。
+- HLS manifest を読み、WebVTT字幕セグメントを直接取得してTXT化。
+- 既存字幕を使う場合はOpenAI Transcription APIを呼ばない（API費用なし）。
+- 字幕URLではMP3ダウンロードを表示しない。
+- 通常の音声M3U8は従来どおり ffmpeg → MP3 → OpenAI API。
+- YouTube / Vimeo / SmartVision / IR Webcasting / TS等の既存対応は維持。
 
-例:
-`https://www.irwebcasting.com/20260814/1/440f7327b9/mov/main/index.html`
-
-このページではページ情報から「GMOペイメントゲートウェイ株式会社」「2026年9月期 第3四半期」「2026-08-14」の取得を試みます。
-
-## Streamlit Community Cloud
-1. ZIP内の `app.py`, `requirements.txt`, `packages.txt`, `README.md` をGitHubリポジトリ直下へ上書き
-2. Streamlit CloudはPython 3.11を選択
-3. App settings → Secrets に以下を設定
-
-```toml
-OPENAI_API_KEY = "sk-..."
-```
-
-4. Reboot app
-
-## 注意
-IR配信サイトの実装は変更される場合があります。Cookie/認証/DRMやJavaScriptで実行時にのみ生成される署名URLの場合、自動取得できないことがあります。その場合はDevTools Networkからm3u8/mp4等を直接入力してください。
+## 原因
+Q4の `.../captions/.../subtitles.m3u8` は音声プレイリストではなく字幕(WebVTT)プレイリストです。v14は拡張子だけで通常M3U8と判定してffmpegでMP3化しようとしていたため、文字起こし経路が不適切でした。
