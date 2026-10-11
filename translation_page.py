@@ -2,6 +2,8 @@ import io, os, re, json, time, zipfile, hashlib
 from pathlib import Path
 import requests
 import streamlit as st
+from urllib.parse import urlencode
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
 st.title('🌐 TXT / Google Docs・Drive 全文日本語翻訳')
 st.caption('元のメタデータを一字一句保持・全文翻訳・途中再開・TXT出力')
@@ -169,6 +171,126 @@ with st.sidebar:
     usd_jpy=st.number_input('参考為替 USD/JPY（任意設定）',min_value=0.01,value=150.0,step=1.0,format='%.2f',key='translation_usd_jpy')
 
 
+# Google OAuth Authorization Code flow, configured via Streamlit secrets.
+# Tokens live in the user's Streamlit session, not in source files.
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+
+def _google_settings():
+    try:
+        values = dict(st.secrets)
+    except Exception:
+        values = {}
+    def setting(name):
+        return str(values.get(name, os.getenv(name, ""))).strip()
+    return setting("GOOGLE_CLIENT_ID"), setting("GOOGLE_CLIENT_SECRET"), setting("GOOGLE_REDIRECT_URI"), setting("GOOGLE_OAUTH_STATE_SECRET")
+
+def _google_signer():
+    _, _, _, secret = _google_settings()
+    if not secret or len(secret) < 24:
+        raise RuntimeError("GOOGLE_OAUTH_STATE_SECRET に24文字以上のランダム文字列を設定してください。")
+    return URLSafeTimedSerializer(secret, salt="ir-webcast-google-drive-oauth-v1")
+
+def _google_login_url():
+    import secrets as pysecrets
+    client_id, client_secret, redirect_uri, _ = _google_settings()
+    if not client_id or not client_secret or not redirect_uri:
+        raise RuntimeError("Streamlit Secretsに GOOGLE_CLIENT_ID、GOOGLE_CLIENT_SECRET、GOOGLE_REDIRECT_URI を設定してください。")
+    if not redirect_uri.startswith("https://") and not redirect_uri.startswith("http://localhost:"):
+        raise RuntimeError("GOOGLE_REDIRECT_URIにはHTTPSのアプリURLを設定してください。")
+    nonce=pysecrets.token_urlsafe(24)
+    st.session_state["google_oauth_nonce"]=nonce
+    state=_google_signer().dumps({"nonce":nonce,"v":1})
+    return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
+        "client_id":client_id, "redirect_uri":redirect_uri, "response_type":"code",
+        "scope":DRIVE_SCOPE, "access_type":"offline", "prompt":"consent",
+        "include_granted_scopes":"true", "state":state,
+    })
+
+def _google_oauth_callback():
+    params=st.query_params
+    if "error" in params:
+        st.error("Google認証がキャンセルされました: "+str(params.get("error")))
+        st.query_params.clear()
+        return
+    if "code" not in params:
+        return
+    try:
+        state=str(params.get("state",""))
+        payload=_google_signer().loads(state,max_age=600)
+        nonce=st.session_state.get("google_oauth_nonce")
+        if not payload.get("nonce"):
+            raise RuntimeError("Google認証のstateにnonceがありません。") 
+        # The signed, short-lived state also works if Streamlit starts a fresh
+        # WebSocket session after the Google redirect. Match the nonce when
+        # the original Streamlit session survived the round trip.
+        if nonce and payload.get("nonce")!=nonce:
+            raise RuntimeError("認証状態が一致しません。もう一度ログインしてください。")
+        client_id,client_secret,redirect_uri,_=_google_settings()
+        result=requests.post("https://oauth2.googleapis.com/token",data={
+            "code":str(params["code"]), "client_id":client_id,
+            "client_secret":client_secret,"redirect_uri":redirect_uri,
+            "grant_type":"authorization_code",
+        },timeout=30)
+        result.raise_for_status()
+        token=result.json()
+        if not token.get("access_token"):
+            raise RuntimeError("Googleからアクセストークンが返されませんでした。")
+        st.session_state["google_drive_tokens"]={
+            "access_token":token["access_token"],
+            "refresh_token":token.get("refresh_token"),
+            "expires_at":time.time()+int(token.get("expires_in",3600)),
+        }
+        st.session_state.pop("google_oauth_nonce",None)
+        st.success("Google Driveへの接続が完了しました。")
+    except (BadSignature,SignatureExpired):
+        st.error("Google認証の状態確認に失敗しました。もう一度ログインしてください。")
+    except Exception as exc:
+        st.error(f"Google認証に失敗しました: {exc}")
+    finally:
+        # Do not retain single-use authorization codes in browser history/query params.
+        st.query_params.clear()
+
+def _google_access_token():
+    tokens=st.session_state.get("google_drive_tokens") or {}
+    access=tokens.get("access_token")
+    if not access:
+        raise RuntimeError("Googleアカウントでログインしてください。")
+    if time.time()<float(tokens.get("expires_at",0))-90:
+        return access
+    refresh=tokens.get("refresh_token")
+    if not refresh:
+        st.session_state.pop("google_drive_tokens",None)
+        raise RuntimeError("Google認証の有効期限が切れました。再ログインしてください。")
+    client_id,client_secret,_,_=_google_settings()
+    result=requests.post("https://oauth2.googleapis.com/token",data={
+        "client_id":client_id,"client_secret":client_secret,
+        "refresh_token":refresh,"grant_type":"refresh_token",
+    },timeout=30)
+    if not result.ok:
+        st.session_state.pop("google_drive_tokens",None)
+        raise RuntimeError("Googleの認証更新に失敗しました。再ログインしてください。")
+    refreshed=result.json()
+    tokens["access_token"]=refreshed["access_token"]
+    tokens["expires_at"]=time.time()+int(refreshed.get("expires_in",3600))
+    st.session_state["google_drive_tokens"]=tokens
+    return tokens["access_token"]
+
+def google_login_panel():
+    st.subheader("Google Drive接続")
+    _google_oauth_callback()
+    if st.session_state.get("google_drive_tokens"):
+        st.success("Google Driveに接続済み")
+        if st.button("Google Driveからログアウト",key="google_drive_logout"):
+            st.session_state.pop("google_drive_tokens",None)
+            st.rerun()
+    else:
+        try:
+            url=_google_login_url()
+            st.link_button("Googleアカウントでログイン",url,type="primary")
+        except Exception as exc:
+            st.warning(str(exc))
+            st.caption("初回のみGoogle CloudでOAuthクライアントの設定が必要です。READMEをご確認ください。")
+
 # Separate tool: convert every TXT in a Google Drive folder to native Google Docs.
 def _folder_id(url):
     from urllib.parse import urlparse, parse_qs
@@ -266,13 +388,12 @@ def folder_converter_page():
     st.caption('指定フォルダ直下のTXTをGoogleドキュメント形式で同じフォルダに新規作成。元のTXTは削除しません。')
     folder_url = st.text_input('Google DriveフォルダURL', key='convert_folder_url',
                                placeholder='https://drive.google.com/drive/u/0/folders/...')
-    access_token = st.text_input('Google Drive OAuthアクセストークン（書き込み権限が必要）',
-                                 type='password', key='convert_access_token')
-    st.caption('Drive APIの `drive` スコープなど、対象ファイルの読み書きが許可されたトークンが必要です。OpenAI APIキーとは別です。')
+    google_login_panel()
+    st.caption('Googleアカウントでログイン後、フォルダURLを入力してください。トークンの手動入力は不要です。')
     if st.button('TXTファイルを検索', key='convert_scan'):
         try:
             folder_id = _folder_id(folder_url)
-            headers = _drive_auth_headers(access_token)
+            headers = _drive_auth_headers(_google_access_token())
             items = _list_folder(folder_id, headers)
             txts = [f for f in items if f.get('mimeType') == 'text/plain' and f.get('name','').lower().endswith('.txt')]
             existing_docs = {f.get('name') for f in items if f.get('mimeType') == 'application/vnd.google-apps.document'}
@@ -297,7 +418,7 @@ def folder_converter_page():
             try:
                 if _folder_id(folder_url) != scan['folder_id']:
                     raise ValueError('フォルダURLが変更されています。再検索してください。')
-                headers = _drive_auth_headers(access_token)
+                headers = _drive_auth_headers(_google_access_token())
                 # Re-scan at execution time to avoid duplicate docs created by other users since preview.
                 live_items = _list_folder(scan['folder_id'], headers)
                 existing = {f['name'] for f in live_items if f.get('mimeType') == 'application/vnd.google-apps.document'}
@@ -350,10 +471,10 @@ if mode=='TXTファイルをアップロード':
 else:
     url=st.text_input('Google Docs / DriveのURL',placeholder='https://drive.google.com/file/d/.../view')
     st.caption('Googleドキュメント（/document/d/）と、Google Driveに保存したTXT（/file/d/）の両方に対応します。')
-    token=st.text_input('OAuthアクセストークン（非公開ドキュメントの場合・任意）',type='password')
+    google_login_panel()
     if st.button('ドキュメントを読み込む'):
         try:
-            raw,filename=fetch_google_doc(url,token)
+            raw,filename=fetch_google_doc(url,_google_access_token() if st.session_state.get('google_drive_tokens') else '')
             st.session_state['source']=(raw,filename,url)
         except Exception as e:st.error(str(e))
     if 'source' in st.session_state and st.session_state['source'][2]==url:
