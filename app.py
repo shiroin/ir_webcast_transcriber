@@ -16,8 +16,13 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="IR Webcast Transcriber v17", page_icon="🎧", layout="centered")
-st.title("🎧 IR Webcast Transcriber v17")
+st.set_page_config(page_title="IR Webcast Transcriber", page_icon="🎧", layout="centered")
+page = st.radio("機能を選択", ["🎧 IR Webcast 文字起こし", "🌐 TXT・Google Docs 全文翻訳"], horizontal=True, key="ir_page")
+if page == "🌐 TXT・Google Docs 全文翻訳":
+    import translation_page  # 同一Streamlitアプリ内で翻訳画面を表示
+    st.stop()
+
+st.title("🎧 IR Webcast Transcriber")
 st.caption("音声取得はStreamlit、文字起こしは外部API。YouTube / Vimeo / SmartVision IR / Q4字幕M3U8 / MP3 / M3U8 / TS / IR webcastページ / IR Webcasting、英・中・韓・日に対応。")
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36"
