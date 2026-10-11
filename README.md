@@ -1,13 +1,10 @@
-# IR Webcast Transcriber v21 — 翻訳画面ブラックアウト修正
+# IR Webcast Transcriber v22
+- Google Docs URL `/document/d/<id>` と Google Drive TXT URL `/file/d/<id>`、`open?id=<id>` に対応
+- Google Drive TXTは公開共有なら直接ダウンロード。非公開はDrive APIでOAuthアクセストークンを使用
+- HTMLログイン画面や非テキスト応答はエラーとして表示
+- 出力名は `Japanese_Translation_` + 入力ファイル名（Google URLでは `GoogleDrive_<id>.txt` / `GoogleDoc_<id>.txt`）
+- メタデータヘッダーは**原文のまま一切書き換えず**保持。翻訳本文は別セクションに配置
+- 既存のIR Webcast文字起こし機能は保持
+- Python構文チェック済み。クラウド環境での動作は未確認
 
-## 原因
-v20では `import translation_page` を使用していたため、Streamlitの再実行時にPythonのモジュールキャッシュが働き、翻訳画面の描画処理が再実行されないことがありました。
-
-## 修正
-`runpy.run_path()` で翻訳画面を毎回実行するよう変更しました。ラジオボタンの選択・Google Docs入力・ファイルアップロード後の再実行でも画面が維持されます。
-
-## 更新
-ZIP内の `app.py`、`translation_page.py`、`requirements.txt`、`packages.txt` を既存のStreamlitアプリのリポジトリ直下に上書きしてください。Streamlit Cloudで再起動してください。
-
-## 検証
-Python構文チェック済み。Streamlit Cloudでの実機動作確認は未実施。
+GitHubリポジトリ直下の `app.py` と `translation_page.py` を上書きしてください。

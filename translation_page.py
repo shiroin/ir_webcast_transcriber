@@ -4,7 +4,7 @@ import requests
 import streamlit as st
 
 st.title('🌐 TXT / Googleドキュメント 全文日本語翻訳')
-st.caption('メタデータ保持・全文翻訳・途中再開・TXT出力')
+st.caption('元のメタデータを一字一句保持・全文翻訳・途中再開・TXT出力')
 
 MODEL_DEFAULT='gpt-4.1-mini'
 API='https://api.openai.com/v1/chat/completions'
@@ -37,17 +37,72 @@ def chunks(text, max_chars=6500):
 
 
 def fetch_google_doc(url, token=''):
-    match=re.search(r'/document/d/([\w-]+)',url)
-    if not match: raise ValueError('GoogleドキュメントのURLを入力してください（/document/d/...）。')
-    doc_id=match.group(1)
-    headers={'Authorization':f'Bearer {token}'} if token else {}
-    r=requests.get(f'https://docs.google.com/document/d/{doc_id}/export',params={'format':'txt'},headers=headers,timeout=45)
-    if r.status_code!=200:
-        raise RuntimeError(f'Googleドキュメント取得失敗（HTTP {r.status_code}）。非公開の場合はTXTをアップロードするか、OAuthアクセストークンを入力してください。')
-    if 'text/html' in r.headers.get('Content-Type','').lower():
-        raise RuntimeError('Googleログイン画面が返されました。公開設定を確認するか、TXTをアップロードしてください。')
-    return r.content.decode('utf-8-sig'), f'GoogleDoc_{doc_id}.txt'
+    """Read Google Docs and plain-text Google Drive files.
 
+    Supported:
+      docs.google.com/document/d/<id>/...
+      drive.google.com/file/d/<id>/view
+      drive.google.com/open?id=<id>
+    OAuth token must have access to the source file.
+    """
+    url = url.strip()
+    doc_match = re.search(r'(?:docs\\.google\\.com/document/d/)([\\w-]+)', url)
+    drive_match = re.search(r'(?:drive\\.google\\.com/file/d/)([\\w-]+)', url)
+    query_match = re.search(r'[?&]id=([\\w-]+)', url)
+    if doc_match:
+        file_id, kind = doc_match.group(1), 'doc'
+    elif drive_match:
+        file_id, kind = drive_match.group(1), 'file'
+    elif query_match and ('drive.google.com' in url or 'docs.google.com' in url):
+        file_id, kind = query_match.group(1), 'file'
+    else:
+        raise ValueError('Googleドキュメント（/document/d/）またはGoogle DriveのTXTファイル（/file/d/）のURLを入力してください。')
+
+    headers = {'Authorization': f'Bearer {token.strip()}'} if token.strip() else {}
+    session = requests.Session()
+
+    if token.strip():
+        if kind == 'doc':
+            endpoint = f'https://www.googleapis.com/drive/v3/files/{file_id}/export'
+            params = {'mimeType': 'text/plain'}
+        else:
+            endpoint = f'https://www.googleapis.com/drive/v3/files/{file_id}'
+            params = {'alt': 'media'}
+    else:
+        if kind == 'doc':
+            endpoint = f'https://docs.google.com/document/d/{file_id}/export'
+            params = {'format': 'txt'}
+        else:
+            endpoint = 'https://drive.google.com/uc'
+            params = {'export': 'download', 'id': file_id}
+
+    response = session.get(endpoint, params=params, headers=headers, timeout=60, allow_redirects=True)
+    if response.status_code != 200:
+        raise RuntimeError(
+            f'Google Driveから取得できませんでした（HTTP {response.status_code}）。'
+            '共有設定またはOAuthアクセストークンのアクセス権限を確認してください。'
+        )
+    ctype = response.headers.get('Content-Type', '').lower()
+    sample = response.content[:2048].lstrip().lower()
+    if ('text/html' in ctype or sample.startswith(b'<!doctype html') or sample.startswith(b'<html')):
+        raise RuntimeError(
+            'Googleからログイン画面またはダウンロード確認画面が返されました。'
+            'ファイルを「リンクを知っている全員が閲覧可」にするか、'
+            'アクセス権のあるOAuthトークンを使うか、TXTを直接アップロードしてください。'
+        )
+    if b'\\x00' in response.content[:4096]:
+        raise RuntimeError('テキスト以外のファイルが返されました。TXTファイルのURLを指定してください。')
+    try:
+        content = response.content.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        try:
+            content = response.content.decode('cp932')
+        except UnicodeDecodeError:
+            raise RuntimeError('テキストをUTF-8またはShift_JISとして読み込めませんでした。TXTを直接アップロードしてください。')
+    if not content.strip():
+        raise RuntimeError('ファイルが空でした。')
+    # The Drive file ID is stable and avoids falsely claiming the original filename.
+    return content, f'GoogleDoc_{file_id}.txt' if kind == 'doc' else f'GoogleDrive_{file_id}.txt'
 
 def translate_chunk(key,model,part,idx,total,extra):
     system=('You are a professional Japanese translator of corporate financial earnings call transcripts. '
@@ -96,7 +151,7 @@ with st.sidebar:
     extra=st.text_area('用語・翻訳上の追加指示（任意）',placeholder='例：inference=推論、ramp=量産立ち上げ')
     st.caption('APIキーはこのアプリから翻訳APIへのリクエストにのみ使用します。利用料金はAPI側で発生します。')
 
-mode=st.radio('入力方法',['TXTファイルをアップロード','GoogleドキュメントのURL'],horizontal=True)
+mode=st.radio('入力方法',['TXTファイルをアップロード','Google Docs / DriveのURL'],horizontal=True)
 raw=None;filename=None
 if mode=='TXTファイルをアップロード':
     uploaded=st.file_uploader('TXTを選択（UTF-8推奨）',type=['txt'])
@@ -107,7 +162,8 @@ if mode=='TXTファイルをアップロード':
             except UnicodeDecodeError:st.error('文字コードを判定できませんでした。UTF-8に変換してください。')
         filename=uploaded.name
 else:
-    url=st.text_input('GoogleドキュメントのURL',placeholder='https://docs.google.com/document/d/.../edit')
+    url=st.text_input('Google Docs / DriveのURL',placeholder='https://drive.google.com/file/d/.../view')
+    st.caption('Googleドキュメント（/document/d/）と、Google Driveに保存したTXT（/file/d/）の両方に対応します。')
     token=st.text_input('OAuthアクセストークン（非公開ドキュメントの場合・任意）',type='password')
     if st.button('ドキュメントを読み込む'):
         try:
