@@ -451,9 +451,88 @@ def folder_converter_page():
                 st.error(f'一括変換を開始できませんでした: {exc}')
 
 
+def pdf_to_txt_page():
+    """Extract selectable PDF text locally; never fabricate OCR text."""
+    import fitz
+    st.subheader('📄 PDF → メタデータ付きTXT')
+    st.caption('PDFのテキストをページ順に抽出し、先頭に企業名・決算期などのメタデータを付けます。OpenAI APIは使わず、変換自体にAPI料金は発生しません。')
+    uploaded_pdf=st.file_uploader('決算スクリプトのPDFをアップロード',type=['pdf'],key='pdf_source_upload')
+    if not uploaded_pdf:
+        return
+    pdf_bytes=uploaded_pdf.getvalue()
+    pdf_hash=hashlib.sha256(pdf_bytes).hexdigest()
+    try:
+        doc=fitz.open(stream=pdf_bytes,filetype='pdf')
+        if doc.needs_pass:
+            st.error('パスワード付きPDFには対応していません。解除したPDFを使用してください。')
+            doc.close()
+            return
+        page_count=len(doc)
+        if page_count==0:
+            st.error('PDFにページがありません。')
+            doc.close()
+            return
+        extracted=[]
+        empty_pages=[]
+        for page_idx,page in enumerate(doc):
+            text=page.get_text('text',sort=True).strip()
+            if not text:
+                empty_pages.append(page_idx+1)
+            extracted.append(text)
+        pdf_metadata=doc.metadata or {}
+        doc.close()
+    except Exception as exc:
+        st.error(f'PDFを読み込めませんでした: {exc}')
+        return
+    st.info(f'ページ数: {page_count}｜抽出文字数: {sum(len(x) for x in extracted):,}｜文字を抽出できないページ: {len(empty_pages)}')
+    if empty_pages:
+        st.warning(f'ページ {", ".join(map(str,empty_pages[:30]))} はテキストを抽出できませんでした。'
+                   'スキャン画像PDFの場合はOCRが必要です。この機能では画像から文字を推測・生成しません。')
+    company=st.text_input('企業名',key='pdf_meta_company',placeholder='例: NVIDIA')
+    period=st.text_input('決算期',key='pdf_meta_period',placeholder='例: FY2027 Q2')
+    event_date=st.text_input('決算発表日・イベント日',key='pdf_meta_date',placeholder='例: 2026-08-26')
+    source_url=st.text_input('原本PDFのURL（任意）',key='pdf_meta_url')
+    title=st.text_input('資料タイトル（任意）',value=str(pdf_metadata.get('title') or ''),key='pdf_meta_title')
+    preserve_pages=st.checkbox('本文にページ区切りを残す',value=True,key='pdf_preserve_pages')
+    header_lines=[
+        '# IR Webcast Metadata',
+        f'- Company: {company}',
+        f'- Fiscal Period: {period}',
+        f'- Event Date: {event_date}',
+        f'- Document Title: {title}',
+        f'- Original Filename: {Path(uploaded_pdf.name).name}',
+        f'- Source URL: {source_url}',
+        '- Source Format: PDF',
+        '- Extraction Method: PyMuPDF text extraction (no OCR)',
+        f'- Source Pages: {page_count}',
+        f'- Source SHA256: {pdf_hash}',
+    ]
+    body_parts=[]
+    for idx,text in enumerate(extracted,1):
+        if preserve_pages:
+            body_parts.append(f'===== 原本 {idx} ページ =====\\n{text}')
+        elif text:
+            body_parts.append(text)
+    body='\\n\\n'.join(body_parts)
+    txt='\\n'.join(header_lines)+'\\n\\n# Original Transcript\\n\\n'+body+'\\n'
+    st.caption('入力されていないメタデータは空欄のまま残します。企業名や日付はPDFから推測しません。')
+    with st.expander('変換結果の先頭をプレビュー',expanded=True):
+        st.code(txt[:5000],language='text')
+    if not body.strip() or not any(x.strip() for x in extracted):
+        st.error('PDFから本文を抽出できませんでした。OCR済みPDFを使用してください。')
+        return
+    name=Path(uploaded_pdf.name).stem+'.txt'
+    st.download_button('メタデータ付きTXTをダウンロード',data=txt.encode('utf-8-sig'),
+                       file_name=name,mime='text/plain',type='primary',
+                       key='pdf_txt_download')
+    st.success('TXT変換完了。ダウンロードしたTXTを「全文日本語翻訳」タブにアップロードできます。')
+
 feature = st.radio('翻訳ツール内の機能',
-                   ['全文日本語翻訳', 'フォルダ内TXTをGoogleドキュメントに一括変換'],
+                   ['全文日本語翻訳', 'PDFをメタデータ付きTXTに変換', 'フォルダ内TXTをGoogleドキュメントに一括変換'],
                    horizontal=True, key='translation_feature')
+if feature == 'PDFをメタデータ付きTXTに変換':
+    pdf_to_txt_page()
+    st.stop()
 if feature == 'フォルダ内TXTをGoogleドキュメントに一括変換':
     folder_converter_page()
     st.stop()
