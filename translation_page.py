@@ -488,12 +488,12 @@ def pdf_to_txt_page():
     if empty_pages:
         st.warning(f'ページ {", ".join(map(str,empty_pages[:30]))} はテキストを抽出できませんでした。'
                    'スキャン画像PDFの場合はOCRが必要です。この機能では画像から文字を推測・生成しません。')
-    company=st.text_input('企業名',key='pdf_meta_company',placeholder='例: NVIDIA')
-    period=st.text_input('決算期',key='pdf_meta_period',placeholder='例: FY2027 Q2')
-    event_date=st.text_input('決算発表日・イベント日',key='pdf_meta_date',placeholder='例: 2026-08-26')
-    source_url=st.text_input('原本PDFのURL（任意）',key='pdf_meta_url')
-    title=st.text_input('資料タイトル（任意）',value=str(pdf_metadata.get('title') or ''),key='pdf_meta_title')
-    preserve_pages=st.checkbox('本文にページ区切りを残す',value=True,key='pdf_preserve_pages')
+    company=st.text_input('企業名',key=f'pdf_meta_company_{pdf_hash}',placeholder='例: NVIDIA')
+    period=st.text_input('決算期',key=f'pdf_meta_period_{pdf_hash}',placeholder='例: FY2027 Q2')
+    event_date=st.text_input('決算発表日・イベント日',key=f'pdf_meta_date_{pdf_hash}',placeholder='例: 2026-08-26')
+    source_url=st.text_input('原本PDFのURL（任意）',key=f'pdf_meta_url_{pdf_hash}')
+    title=st.text_input('資料タイトル（任意）',value=str(pdf_metadata.get('title') or ''),key=f'pdf_meta_title_{pdf_hash}')
+    preserve_pages=st.checkbox('本文にページ区切りを残す',value=True,key=f'pdf_preserve_pages_{pdf_hash}')
     header_lines=[
         '# IR Webcast Metadata',
         f'- Company: {company}',
@@ -510,12 +510,18 @@ def pdf_to_txt_page():
     body_parts=[]
     for idx,text in enumerate(extracted,1):
         if preserve_pages:
-            body_parts.append(f'===== 原本 {idx} ページ =====\\n{text}')
+            body_parts.append(f'===== 原本 {idx} ページ =====\n{text}')
         elif text:
             body_parts.append(text)
-    body='\\n\\n'.join(body_parts)
-    txt='\\n'.join(header_lines)+'\\n\\n# Original Transcript\\n\\n'+body+'\\n'
+    body='\n\n'.join(body_parts)
+    txt='\n'.join(header_lines)+'\n\n# Original Transcript\n\n'+body+'\n'
+    # Verify the output is parsed as metadata + body by the translation tab.
+    parsed_header,parsed_body,_=split_metadata(txt)
+    if not parsed_header.startswith('# IR Webcast Metadata\n') or not parsed_body.strip():
+        st.error('メタデータの生成に失敗しました。ダウンロードせず再度お試しください。')
+        return
     st.caption('入力されていないメタデータは空欄のまま残します。企業名や日付はPDFから推測しません。')
+    st.success(f'メタデータ認識OK：{len(parsed_header):,}文字｜本文：{len(parsed_body):,}文字')
     with st.expander('変換結果の先頭をプレビュー',expanded=True):
         st.code(txt[:5000],language='text')
     if not body.strip() or not any(x.strip() for x in extracted):

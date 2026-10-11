@@ -1,7 +1,10 @@
-# v28 PDF→メタデータ付きTXT
+# v29 メタデータ修正版
 
-新しい「PDFをメタデータ付きTXTに変換」タブでPDFをアップロードし、企業名・決算期・イベント日・タイトル・URLを入力。PDFテキストをページ順に抽出し、IR Webcast Metadataヘッダーと # Original Transcript 区切りを付けたUTF-8 TXTをダウンロードできます。続いて「全文日本語翻訳」にアップロードしてください。
+- v28のPDF→TXTで、改行が `\\n` として出力されていた不具合を修正。実際の改行として出力。
+- 翻訳機能が認識する `# Original Transcript` を独立した行に配置。
+- TXTのダウンロード前にメタデータと本文の分離チェックを追加。
+- PDFを入れ替えたときに前のPDFのメタデータ入力値が残らないよう、ファイル固有の入力キーを使用。
+- 既存の文字起こし・翻訳・API料金表示・Google Drive機能を維持。
 
-PyMuPDFを使用するためOpenAI API料金は発生しません。画像だけのスキャンPDFにはOCRが必要です（本版ではOCRなし）。複雑な段組や表の読み順は確認してください。既存の翻訳・料金表示・Google Drive変換・Googleログインは維持。
-
-GitHubにZIP内のapp.py、translation_page.py、requirements.txt、packages.txtを上書きしてください。Googleログイン設定はv27と同じです。
+## 更新方法
+ZIP内のファイルをGitHubのアプリ直下へ上書きし、Streamlit Cloudを再起動してください。
