@@ -19,7 +19,11 @@ from bs4 import BeautifulSoup
 st.set_page_config(page_title="IR Webcast Transcriber", page_icon="🎧", layout="centered")
 page = st.radio("機能を選択", ["🎧 IR Webcast 文字起こし", "🌐 TXT・Google Docs 全文翻訳"], horizontal=True, key="ir_page")
 if page == "🌐 TXT・Google Docs 全文翻訳":
-    import translation_page  # 同一Streamlitアプリ内で翻訳画面を表示
+    # Streamlit reruns app.py on every interaction, but Python imports are cached.
+    # runpy executes the translation page afresh on every rerun, preventing a blank page.
+    import runpy
+    from pathlib import Path
+    runpy.run_path(str(Path(__file__).resolve().parent / "translation_page.py"), run_name="__main__")
     st.stop()
 
 st.title("🎧 IR Webcast Transcriber")
