@@ -908,7 +908,15 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
             st.text_area("Transcript", transcript_with_tags, height=450)
             if translate_enabled:
                 status.info("日本語訳を作成中…")
-                japanese_translation = translate_to_japanese(transcript_with_tags, api_key, usage_stats=translation_usage)
+                # Keep metadata deterministic: copy field values from the source verbatim.
+                # Translate only the transcript body so the model cannot omit or alter tags.
+                translated_body = translate_to_japanese(text, api_key, usage_stats=translation_usage)
+                japanese_metadata = "# IR Webcast メタデータ\n" + "\n".join(
+                    "- " + line.replace("Transcription model:", "文字起こしモデル:")
+                               .replace("Transcript source:", "原文取得元:")
+                    for line in tags
+                )
+                japanese_translation = japanese_metadata + "\n\n# 日本語訳\n" + translated_body
                 st.text_area("日本語訳", japanese_translation, height=450)
                 zip_bytes = bundle_original_and_translation(transcript_with_tags, japanese_translation, base_name)
                 st.download_button(
