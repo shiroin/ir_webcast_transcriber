@@ -5,6 +5,10 @@ import shutil
 import subprocess
 import tempfile
 import time
+import io
+import zipfile
+import csv
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -12,8 +16,8 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="IR Webcast Transcriber v15", page_icon="🎧", layout="centered")
-st.title("🎧 IR Webcast Transcriber v15")
+st.set_page_config(page_title="IR Webcast Transcriber v17", page_icon="🎧", layout="centered")
+st.title("🎧 IR Webcast Transcriber v17")
 st.caption("音声取得はStreamlit、文字起こしは外部API。YouTube / Vimeo / SmartVision IR / Q4字幕M3U8 / MP3 / M3U8 / TS / IR webcastページ / IR Webcasting、英・中・韓・日に対応。")
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36"
@@ -522,6 +526,68 @@ def make_api_chunks(audio_path, out_dir, chunk_minutes=12):
     return chunks
 
 
+
+def translate_to_japanese(transcript, api_key, model="gpt-4o-mini", usage_stats=None):
+    """Translate the original transcript in bounded chunks, retaining order and formatting."""
+    chunks = []
+    remaining = transcript
+    while remaining:
+        if len(remaining) <= 8500:
+            chunks.append(remaining)
+            break
+        split_at = remaining.rfind("\\n", 0, 8500)
+        if split_at < 3500:
+            split_at = 8500
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+    translated = []
+    for i, chunk in enumerate(chunks):
+        last_error = None
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": model,
+                        "temperature": 0,
+                        "messages": [
+                            {"role": "system", "content": (
+                                "Translate the provided earnings-call transcript into accurate, natural Japanese. "
+                                "Do not summarize, omit, add or explain. Preserve all figures, company names, "
+                                "speaker names, timestamps, paragraph breaks and metadata. "
+                                "Translate each part faithfully. Output only the translated text."
+                            )},
+                            {"role": "user", "content": chunk},
+                        ],
+                    },
+                    timeout=180,
+                )
+                if response.ok:
+                    data = response.json()
+                    translated.append(data["choices"][0]["message"]["content"])
+                    if usage_stats is not None:
+                        usage = data.get("usage", {})
+                        usage_stats["input_tokens"] += int(usage.get("prompt_tokens", 0))
+                        usage_stats["output_tokens"] += int(usage.get("completion_tokens", 0))
+                    break
+                last_error = f"翻訳API HTTP {response.status_code}: {response.text[:500]}"
+            except Exception as e:
+                last_error = str(e)
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+        else:
+            raise RuntimeError(f"日本語訳の第{i+1}/{len(chunks)}部分で失敗: {last_error}")
+    return "".join(translated)
+
+
+def bundle_original_and_translation(original, translated, base_name):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"{base_name}_transcript.txt", original.encode("utf-8"))
+        archive.writestr(f"Japanese_Translation_{base_name}_transcript.txt", translated.encode("utf-8"))
+    return buf.getvalue()
+
 def secret_api_key():
     try:
         return str(st.secrets.get("OPENAI_API_KEY", "") or "").strip()
@@ -529,7 +595,7 @@ def secret_api_key():
         return ""
 
 
-def transcribe_api_chunk(path, api_key, model, language, prompt="", retries=3):
+def transcribe_api_chunk(path, api_key, model, language, prompt="", retries=3, usage_stats=None):
     headers = {"Authorization": f"Bearer {api_key}"}
     data = {"model": model, "response_format": "json"}
     if language != "auto":
@@ -545,6 +611,12 @@ def transcribe_api_chunk(path, api_key, model, language, prompt="", retries=3):
                 r = requests.post(OPENAI_TRANSCRIBE_URL, headers=headers, data=data, files=files, timeout=900)
             if r.status_code == 200:
                 payload = r.json()
+                if usage_stats is not None:
+                    usage = payload.get("usage", {})
+                    if isinstance(usage, dict):
+                        usage_stats["input_tokens"] += int(usage.get("input_tokens", 0))
+                        usage_stats["output_tokens"] += int(usage.get("output_tokens", 0))
+                        usage_stats["usage_reported"] = True
                 return (payload.get("text") or "").strip()
             msg = r.text[-3000:]
             last_error = RuntimeError(f"OpenAI API {r.status_code}: {msg}")
@@ -562,7 +634,7 @@ def fmt_time(seconds):
     return f"{seconds//3600:02d}:{(seconds%3600)//60:02d}:{seconds%60:02d}"
 
 
-def transcribe_via_api(audio_path, api_key, model, language, timestamps, prompt, progress_bar, progress_text):
+def transcribe_via_api(audio_path, api_key, model, language, timestamps, prompt, progress_bar, progress_text, usage_stats=None):
     duration = get_duration_seconds(audio_path)
     chunk_minutes = 12
     chunk_seconds = chunk_minutes * 60
@@ -573,7 +645,7 @@ def transcribe_via_api(audio_path, api_key, model, language, timestamps, prompt,
             start = i * chunk_seconds
             end = min(duration if duration > 0 else (i + 1) * chunk_seconds, (i + 1) * chunk_seconds)
             progress_text.caption(f"文字起こしAPIへ送信中… {i+1}/{len(chunks)}  |  {fmt_time(start)}〜{fmt_time(end)}")
-            text = transcribe_api_chunk(chunk, api_key, model, language, prompt=prompt)
+            text = transcribe_api_chunk(chunk, api_key, model, language, prompt=prompt, usage_stats=usage_stats)
             if text:
                 if timestamps:
                     lines.append(f"[{fmt_time(start)} - {fmt_time(end)}]\n{text}")
@@ -665,6 +737,31 @@ with st.expander("環境チェック", expanded=False):
 if not ffmpeg_available():
     st.error("ffmpeg が見つかりません。Streamlit Cloudでは packages.txt に ffmpeg が必要です。")
 
+translate_enabled = st.checkbox("原文と日本語訳を両方作成する（翻訳API料金が別途発生）", value=True)
+
+with st.expander("API料金設定（概算・USD）"):
+    usd_jpy = st.number_input("USD/JPY", min_value=1.0, value=150.0, step=1.0)
+    st.caption("下記は初期参考値です。利用中モデルの最新公式料金に合わせて変更してください。")
+    transcribe_usd_min = st.number_input("文字起こし 1分あたり USD（概算）", min_value=0.0, value=0.006 if api_model == "gpt-4o-transcribe" else 0.003, step=0.001, format="%.4f")
+    translation_in_per_m = st.number_input("翻訳 入力100万トークンあたり USD", min_value=0.0, value=0.15, step=0.05)
+    translation_out_per_m = st.number_input("翻訳 出力100万トークンあたり USD", min_value=0.0, value=0.60, step=0.10)
+
+if "cost_history" not in st.session_state:
+    st.session_state.cost_history = []
+
+def display_cost_history():
+    if not st.session_state.cost_history:
+        return
+    st.subheader("今回のセッションのAPI費用履歴")
+    st.dataframe(st.session_state.cost_history, use_container_width=True)
+    csv_buf = io.StringIO()
+    writer = csv.DictWriter(csv_buf, fieldnames=list(st.session_state.cost_history[0].keys()))
+    writer.writeheader()
+    writer.writerows(st.session_state.cost_history)
+    st.download_button("費用履歴をCSVでダウンロード", csv_buf.getvalue().encode("utf-8-sig"), "ir_transcriber_api_cost_history.csv", "text/csv")
+    st.caption("履歴は現在のStreamlitセッション内のみ保存。サーバー再起動やセッション終了で消える場合があります。")
+
+
 if st.button("文字起こし開始", type="primary", use_container_width=True):
     if not url.strip():
         st.warning("URLを貼ってください。")
@@ -676,6 +773,9 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
         st.error("yt-dlp が見つかりません。requirements.txt を確認してください。")
         st.stop()
 
+    transcribe_usage = {"input_tokens": 0, "output_tokens": 0, "usage_reported": False}
+    translation_usage = {"input_tokens": 0, "output_tokens": 0}
+    billed_audio_minutes = 0.0
     status = st.empty()
     t0 = time.time()
     try:
@@ -769,12 +869,13 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
                 status.info(f"{source}: 既存字幕の取得完了。音声文字起こしAPIは使用していません。")
             else:
                 duration = get_duration_seconds(audio)
+                billed_audio_minutes = max(0.0, duration / 60)
                 status.info(f"{source}: 音声取得完了（約{duration/60:.1f}分）。外部APIで文字起こし中…")
                 progress_text = st.empty()
                 progress_bar = st.progress(0)
                 text = transcribe_via_api(
                     audio, api_key, api_model, language, timestamps, prompt,
-                    progress_bar=progress_bar, progress_text=progress_text,
+                    progress_bar=progress_bar, progress_text=progress_text, usage_stats=transcribe_usage,
                 )
 
             tags = []
@@ -805,6 +906,46 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
                 st.write(f"**種別:** {event_type}")
 
             st.text_area("Transcript", transcript_with_tags, height=450)
+            if translate_enabled:
+                status.info("日本語訳を作成中…")
+                japanese_translation = translate_to_japanese(transcript_with_tags, api_key, usage_stats=translation_usage)
+                st.text_area("日本語訳", japanese_translation, height=450)
+                zip_bytes = bundle_original_and_translation(transcript_with_tags, japanese_translation, base_name)
+                st.download_button(
+                    "原文＋日本語訳をまとめてダウンロード（ZIP）",
+                    zip_bytes,
+                    f"{base_name}_Original_and_Japanese_Translation.zip",
+                    "application/zip",
+                    use_container_width=True,
+                    type="primary",
+                )
+            transcription_cost = billed_audio_minutes * transcribe_usd_min
+            translation_cost = (
+                translation_usage["input_tokens"] * translation_in_per_m
+                + translation_usage["output_tokens"] * translation_out_per_m
+            ) / 1_000_000
+            total_cost = transcription_cost + translation_cost
+            st.subheader("API費用（推定）")
+            st.metric("今回の推定合計", f"¥{total_cost * usd_jpy:,.2f}", f"${total_cost:.4f}", delta_color="off")
+            st.write(f"文字起こし（音声{billed_audio_minutes:.1f}分）: ${transcription_cost:.4f} / 約¥{transcription_cost*usd_jpy:.2f}")
+            st.write(f"日本語翻訳（入力{translation_usage['input_tokens']:,} / 出力{translation_usage['output_tokens']:,} tokens）: ${translation_cost:.4f} / 約¥{translation_cost*usd_jpy:.2f}")
+            st.caption("翻訳トークン数はAPI応答のusage実測値。文字起こし料金は音声分数×設定単価の概算で、実際の請求額ではありません。")
+            st.session_state.cost_history.append({
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "company": company.strip(), "period": earnings_period.strip(),
+                "source_url": url, "transcription_model": api_model,
+                "audio_minutes": round(billed_audio_minutes, 3),
+                "transcription_input_tokens_reported": transcribe_usage["input_tokens"],
+                "transcription_output_tokens_reported": transcribe_usage["output_tokens"],
+                "translation_input_tokens": translation_usage["input_tokens"],
+                "translation_output_tokens": translation_usage["output_tokens"],
+                "transcription_usd_estimate": round(transcription_cost, 6),
+                "translation_usd_estimate": round(translation_cost, 6),
+                "total_usd_estimate": round(total_cost, 6),
+                "usd_jpy": usd_jpy,
+                "total_jpy_estimate": round(total_cost * usd_jpy, 2),
+            })
+            display_cost_history()
             st.download_button(
                 "TXTをダウンロード", transcript_with_tags.encode("utf-8"),
                 f"{base_name}_transcript.txt", "text/plain", use_container_width=True,
@@ -821,7 +962,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
         st.error("処理に失敗しました。")
         st.code(str(e))
 
-with st.expander("v14のポイント"):
+with st.expander("対応機能"):
     st.markdown("""
 - **SmartVision IR / iframe埋め込み**を追加。親IRページ→iframe→プレイヤーHTML/JS/設定→m3u8/mp4/mp3を浅く再帰探索します。
 - **IR Webcasting (`irwebcasting.com`) 専用解析**も継続。
