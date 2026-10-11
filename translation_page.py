@@ -3,7 +3,7 @@ from pathlib import Path
 import requests
 import streamlit as st
 
-st.title('🌐 TXT / Googleドキュメント 全文日本語翻訳')
+st.title('🌐 TXT / Google Docs・Drive 全文日本語翻訳')
 st.caption('元のメタデータを一字一句保持・全文翻訳・途中再開・TXT出力')
 
 MODEL_DEFAULT='gpt-4.1-mini'
@@ -46,17 +46,20 @@ def fetch_google_doc(url, token=''):
     OAuth token must have access to the source file.
     """
     url = url.strip()
-    doc_match = re.search(r'(?:docs\\.google\\.com/document/d/)([\\w-]+)', url)
-    drive_match = re.search(r'(?:drive\\.google\\.com/file/d/)([\\w-]+)', url)
-    query_match = re.search(r'[?&]id=([\\w-]+)', url)
-    if doc_match:
-        file_id, kind = doc_match.group(1), 'doc'
-    elif drive_match:
-        file_id, kind = drive_match.group(1), 'file'
-    elif query_match and ('drive.google.com' in url or 'docs.google.com' in url):
-        file_id, kind = query_match.group(1), 'file'
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse(url)
+    host = (parsed.hostname or '').lower()
+    segments = [segment for segment in parsed.path.split('/') if segment]
+    if host == 'docs.google.com' and len(segments) >= 3 and segments[:2] == ['document', 'd']:
+        file_id, kind = segments[2], 'doc'
+    elif host in ('drive.google.com', 'www.drive.google.com') and len(segments) >= 3 and segments[:2] == ['file', 'd']:
+        file_id, kind = segments[2], 'file'
+    elif host in ('drive.google.com', 'www.drive.google.com') and parsed.path == '/open':
+        file_id, kind = parse_qs(parsed.query).get('id', [''])[0], 'file'
     else:
-        raise ValueError('Googleドキュメント（/document/d/）またはGoogle DriveのTXTファイル（/file/d/）のURLを入力してください。')
+        raise ValueError('Google Docs（/document/d/）またはGoogle DriveのTXT（/file/d/）のURLを入力してください。')
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', file_id):
+        raise ValueError('URL内のファイルIDを認識できませんでした。')
 
     headers = {'Authorization': f'Bearer {token.strip()}'} if token.strip() else {}
     session = requests.Session()
@@ -90,7 +93,7 @@ def fetch_google_doc(url, token=''):
             'ファイルを「リンクを知っている全員が閲覧可」にするか、'
             'アクセス権のあるOAuthトークンを使うか、TXTを直接アップロードしてください。'
         )
-    if b'\\x00' in response.content[:4096]:
+    if b'\x00' in response.content[:4096]:
         raise RuntimeError('テキスト以外のファイルが返されました。TXTファイルのURLを指定してください。')
     try:
         content = response.content.decode('utf-8-sig')
@@ -101,8 +104,16 @@ def fetch_google_doc(url, token=''):
             raise RuntimeError('テキストをUTF-8またはShift_JISとして読み込めませんでした。TXTを直接アップロードしてください。')
     if not content.strip():
         raise RuntimeError('ファイルが空でした。')
-    # The Drive file ID is stable and avoids falsely claiming the original filename.
-    return content, f'GoogleDoc_{file_id}.txt' if kind == 'doc' else f'GoogleDrive_{file_id}.txt'
+    # Prefer original filename declared in transcript metadata; preserve metadata as-is.
+    declared = re.search(r'(?m)^(?:原本ファイル|原文ファイル名|元ファイル名|Original Filename)\s*[:：]\s*(.+?)\s*$', content)
+    if declared:
+        name = Path(declared.group(1).strip()).name
+        name = re.sub(r'\.(pdf|docx?|md)$', '.txt', name, flags=re.I)
+        if not name.lower().endswith('.txt'):
+            name += '.txt'
+    else:
+        name = f'GoogleDoc_{file_id}.txt' if kind == 'doc' else f'GoogleDrive_{file_id}.txt'
+    return content, name
 
 def translate_chunk(key,model,part,idx,total,extra):
     system=('You are a professional Japanese translator of corporate financial earnings call transcripts. '
@@ -126,14 +137,6 @@ def translate_chunk(key,model,part,idx,total,extra):
             time.sleep(min(2**attempt*2,30))
     raise RuntimeError('APIの再試行回数を超えました')
 
-
-def metadata_as_japanese(header):
-    # Maintain all existing metadata fields and values except language/translation status.
-    header=re.sub(r'(?m)^(本文言語\s*:\s*).*$',r'\1日本語（全文翻訳）',header)
-    header=re.sub(r'(?m)^(翻訳状況\s*:\s*).*$',r'\1全文翻訳済み（機械翻訳・未校正）',header)
-    if not re.search(r'(?m)^本文言語\s*:',header):header+='本文言語: 日本語（全文翻訳）\n'
-    if not re.search(r'(?m)^翻訳状況\s*:',header):header+='翻訳状況: 全文翻訳済み（機械翻訳・未校正）\n'
-    return header
 
 def configured_api_key():
     """Missing secrets.toml must not crash the translation page."""
@@ -199,12 +202,12 @@ if raw is not None and filename:
         complete=len(done)==len(sections)
         rendered='\n\n'.join(done[i] for i in range(len(sections)) if i in done)
         if complete:
-            result=metadata_as_japanese(header)+'\n# 本文（日本語訳）\n'+rendered+'\n'
+            result=header+'\n# 本文（日本語訳）\n'+rendered+'\n'
             st.download_button('日本語訳TXTをダウンロード',result.encode('utf-8-sig'),file_name=output_name,mime='text/plain')
         else:
             partial_name=output_name.replace('.txt','_PARTIAL.txt')
-            partial=header+'\n翻訳状況: 部分翻訳（未完成）\n# 本文（日本語訳・途中まで）\n'+rendered
+            partial=header+'\n# 本文（日本語訳・途中まで）\n'+rendered
             st.download_button('途中経過TXTをダウンロード',partial.encode('utf-8-sig'),file_name=partial_name,mime='text/plain')
         st.text_area('翻訳プレビュー（冒頭）',rendered[:3500],height=260)
 else:
-    st.caption('TXTを選択するか、Googleドキュメントを読み込んでください。')
+    st.caption('TXTをアップロードするか、Google Docs / DriveのURLを読み込んでください。')

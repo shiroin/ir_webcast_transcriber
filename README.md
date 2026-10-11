@@ -1,10 +1,13 @@
-# IR Webcast Transcriber v22
-- Google Docs URL `/document/d/<id>` と Google Drive TXT URL `/file/d/<id>`、`open?id=<id>` に対応
-- Google Drive TXTは公開共有なら直接ダウンロード。非公開はDrive APIでOAuthアクセストークンを使用
-- HTMLログイン画面や非テキスト応答はエラーとして表示
-- 出力名は `Japanese_Translation_` + 入力ファイル名（Google URLでは `GoogleDrive_<id>.txt` / `GoogleDoc_<id>.txt`）
-- メタデータヘッダーは**原文のまま一切書き換えず**保持。翻訳本文は別セクションに配置
-- 既存のIR Webcast文字起こし機能は保持
-- Python構文チェック済み。クラウド環境での動作は未確認
+# IR Webcast Transcriber v23 修正内容
 
-GitHubリポジトリ直下の `app.py` と `translation_page.py` を上書きしてください。
+1. Google Drive TXTの正しいURLでも拒否される問題を修正。`urllib.parse` によるURL判定に変更。
+2. Google Docs（`/document/d/`）・Drive TXT（`/file/d/`）・Drive `open?id=` を判定。
+3. 原文TXT内の `原本ファイル` / `原文ファイル名` を優先して出力名を決定。翻訳TXTは `Japanese_Translation_` で始まります。
+4. 元のメタデータを**変更せずにそのまま出力**（翻訳状況の古い記載も改変しないため、翻訳完了の状態はUIと本文セクションで判別）。
+5. 既存のIR Webcast文字起こしを保持。
+
+**注意**: Google Driveファイルが非公開の場合、URL判定が成功してもダウンロードには適切なOAuthアクセストークンが必要です。アクセストークンがない場合はTXTを直接アップロードできます。
+
+**更新**: GitHubのアプリ直下に `app.py` と `translation_page.py` を上書きし、Streamlit Cloudで再起動。
+
+**検証**: Python構文チェックとURLパーサー単体テスト実施。Google認証・OpenAI API・Streamlit Cloudの実接続は未確認。
