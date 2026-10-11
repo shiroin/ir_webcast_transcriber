@@ -131,7 +131,14 @@ def translate_chunk(key,model,part,idx,total,extra):
             r.raise_for_status()
             translated=r.json()['choices'][0]['message']['content'].strip()
             if not translated: raise RuntimeError('翻訳結果が空でした')
-            return translated
+            usage=r.json().get('usage') or {}
+            return {
+                'text': translated,
+                'input_tokens': int(usage.get('prompt_tokens') or 0),
+                'output_tokens': int(usage.get('completion_tokens') or 0),
+                'cached_input_tokens': int((usage.get('prompt_tokens_details') or {}).get('cached_tokens') or 0),
+                'usage_reported': bool(usage),
+            }
         except requests.RequestException:
             if attempt==4: raise
             time.sleep(min(2**attempt*2,30))
@@ -153,6 +160,182 @@ with st.sidebar:
     model=st.text_input('モデル',value=MODEL_DEFAULT)
     extra=st.text_area('用語・翻訳上の追加指示（任意）',placeholder='例：inference=推論、ramp=量産立ち上げ')
     st.caption('APIキーはこのアプリから翻訳APIへのリクエストにのみ使用します。利用料金はAPI側で発生します。')
+    st.divider()
+    st.subheader('翻訳API料金設定（USD / 100万トークン）')
+    st.caption('モデルの最新単価を確認して入力してください。初期値はgpt-4.1-miniの標準料金の参考値です。モデル変更時は単価も変更してください。')
+    input_price=st.number_input('入力トークン単価（USD）',min_value=0.0,value=0.40,step=0.05,format='%.4f',key='translation_input_price')
+    output_price=st.number_input('出力トークン単価（USD）',min_value=0.0,value=1.60,step=0.05,format='%.4f',key='translation_output_price')
+    cached_price=st.number_input('キャッシュ済み入力トークン単価（USD）',min_value=0.0,value=0.10,step=0.05,format='%.4f',key='translation_cached_price')
+    usd_jpy=st.number_input('参考為替 USD/JPY（任意設定）',min_value=0.01,value=150.0,step=1.0,format='%.2f',key='translation_usd_jpy')
+
+
+# Separate tool: convert every TXT in a Google Drive folder to native Google Docs.
+def _folder_id(url):
+    from urllib.parse import urlparse, parse_qs
+    parsed = urlparse(url.strip())
+    if (parsed.hostname or '').lower() not in ('drive.google.com', 'www.drive.google.com'):
+        raise ValueError('Google DriveフォルダのURLを入力してください。')
+    segments = [x for x in parsed.path.split('/') if x]
+    if 'folders' in segments:
+        idx = segments.index('folders')
+        value = segments[idx + 1] if idx + 1 < len(segments) else ''
+    else:
+        value = parse_qs(parsed.query).get('id', [''])[0]
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', value):
+        raise ValueError('フォルダIDを取得できませんでした。')
+    return value
+
+
+def _drive_auth_headers(token):
+    if not token.strip():
+        raise ValueError('フォルダ内の一覧取得・Googleドキュメント作成にはGoogle Driveの書き込み権限を持つOAuthアクセストークンが必要です。')
+    return {'Authorization': 'Bearer ' + token.strip()}
+
+
+def _drive_get(endpoint, headers, params=None):
+    response = requests.get(endpoint, headers=headers, params=params, timeout=60)
+    if not response.ok:
+        raise RuntimeError(f'Google Drive API HTTP {response.status_code}: {response.text[:450]}')
+    return response.json()
+
+
+def _list_folder(folder_id, headers):
+    items = []
+    page_token = None
+    while True:
+        params = {
+            'q': f"'{folder_id}' in parents and trashed = false",
+            'fields': 'nextPageToken,files(id,name,mimeType,size,parents)',
+            'pageSize': 1000,
+            'supportsAllDrives': 'true',
+            'includeItemsFromAllDrives': 'true',
+        }
+        if page_token:
+            params['pageToken'] = page_token
+        result = _drive_get('https://www.googleapis.com/drive/v3/files', headers, params)
+        items.extend(result.get('files', []))
+        page_token = result.get('nextPageToken')
+        if not page_token:
+            return items
+
+
+def _convert_txt_file(file_info, folder_id, headers):
+    source_id = file_info['id']
+    source_name = file_info['name']
+    response = requests.get(
+        f'https://www.googleapis.com/drive/v3/files/{source_id}',
+        headers=headers,
+        params={'alt': 'media', 'supportsAllDrives': 'true'},
+        timeout=120,
+    )
+    if not response.ok:
+        raise RuntimeError(f'TXT取得 HTTP {response.status_code}: {response.text[:300]}')
+    data = response.content
+    try:
+        decoded = data.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        try:
+            decoded = data.decode('cp932')
+        except UnicodeDecodeError:
+            raise RuntimeError('UTF-8 / Shift_JISとして読み込めません。')
+    if not decoded.strip():
+        raise RuntimeError('空のTXTは変換しません。')
+    # Native Docs import. Source bytes are unchanged and original TXT is retained.
+    new_name = re.sub(r'(?i)\\.txt$', '', source_name)
+    metadata = {'name': new_name, 'mimeType': 'application/vnd.google-apps.document', 'parents': [folder_id]}
+    import requests as _requests
+    from requests_toolbelt.multipart.encoder import MultipartEncoder
+    multipart = MultipartEncoder(fields={
+        'metadata': ('metadata', json.dumps(metadata, ensure_ascii=False), 'application/json; charset=UTF-8'),
+        'file': ('file.txt', decoded.encode('utf-8'), 'text/plain; charset=UTF-8'),
+    })
+    created = _requests.post(
+        'https://www.googleapis.com/upload/drive/v3/files',
+        params={'uploadType': 'multipart', 'fields': 'id,name,mimeType,webViewLink', 'supportsAllDrives': 'true'},
+        headers={**headers, 'Content-Type': multipart.content_type},
+        data=multipart,
+        timeout=180,
+    )
+    if not created.ok:
+        raise RuntimeError(f'Google Docs作成 HTTP {created.status_code}: {created.text[:400]}')
+    return created.json()
+
+
+def folder_converter_page():
+    st.subheader('📁 フォルダ内TXT → Googleドキュメント一括変換')
+    st.caption('指定フォルダ直下のTXTをGoogleドキュメント形式で同じフォルダに新規作成。元のTXTは削除しません。')
+    folder_url = st.text_input('Google DriveフォルダURL', key='convert_folder_url',
+                               placeholder='https://drive.google.com/drive/u/0/folders/...')
+    access_token = st.text_input('Google Drive OAuthアクセストークン（書き込み権限が必要）',
+                                 type='password', key='convert_access_token')
+    st.caption('Drive APIの `drive` スコープなど、対象ファイルの読み書きが許可されたトークンが必要です。OpenAI APIキーとは別です。')
+    if st.button('TXTファイルを検索', key='convert_scan'):
+        try:
+            folder_id = _folder_id(folder_url)
+            headers = _drive_auth_headers(access_token)
+            items = _list_folder(folder_id, headers)
+            txts = [f for f in items if f.get('mimeType') == 'text/plain' and f.get('name','').lower().endswith('.txt')]
+            existing_docs = {f.get('name') for f in items if f.get('mimeType') == 'application/vnd.google-apps.document'}
+            rows = []
+            for f in txts:
+                target_name = re.sub(r'(?i)\\.txt$', '', f['name'])
+                rows.append({'id': f['id'], 'source': f['name'], 'target': target_name,
+                             'status': '既存のGoogleドキュメントあり（スキップ）' if target_name in existing_docs else '変換対象'})
+            st.session_state['folder_conversion_scan'] = {'folder_id': folder_id, 'rows': rows}
+        except Exception as exc:
+            st.error(f'検索できませんでした: {exc}')
+    scan = st.session_state.get('folder_conversion_scan')
+    if scan:
+        rows = scan['rows']
+        pending = [r for r in rows if r['status'] == '変換対象']
+        st.write(f'TXT: {len(rows)}件｜変換対象: {len(pending)}件｜既存の同名Googleドキュメント: {len(rows)-len(pending)}件')
+        if rows:
+            st.dataframe([{'元TXT': r['source'], '変換後Googleドキュメント': r['target'], '状態': r['status']} for r in rows],
+                         use_container_width=True, hide_index=True)
+        confirm = st.checkbox('対象TXTをGoogleドキュメントとして新規作成する（元TXTは保持）', key='convert_confirm')
+        if st.button('一括変換を実行', type='primary', disabled=not (pending and confirm), key='convert_execute'):
+            try:
+                if _folder_id(folder_url) != scan['folder_id']:
+                    raise ValueError('フォルダURLが変更されています。再検索してください。')
+                headers = _drive_auth_headers(access_token)
+                # Re-scan at execution time to avoid duplicate docs created by other users since preview.
+                live_items = _list_folder(scan['folder_id'], headers)
+                existing = {f['name'] for f in live_items if f.get('mimeType') == 'application/vnd.google-apps.document'}
+                live_txt = {f['id']: f for f in live_items if f.get('mimeType') == 'text/plain'}
+                successes = []
+                failures = []
+                skipped = []
+                bar = st.progress(0)
+                for i, row in enumerate(pending):
+                    try:
+                        if row['target'] in existing:
+                            skipped.append(row['source'])
+                        elif row['id'] not in live_txt:
+                            failures.append((row['source'], 'TXTが移動または削除されました'))
+                        else:
+                            created = _convert_txt_file(live_txt[row['id']], scan['folder_id'], headers)
+                            successes.append((row['source'], created.get('id')))
+                            existing.add(row['target'])
+                    except Exception as exc:
+                        failures.append((row['source'], str(exc)))
+                    bar.progress((i+1)/len(pending))
+                st.success(f'変換完了: {len(successes)}件。スキップ: {len(skipped)}件。エラー: {len(failures)}件。')
+                if successes:
+                    st.dataframe([{'元TXT': name, 'Googleドキュメント': f'https://docs.google.com/document/d/{fid}/edit'}
+                                  for name, fid in successes], hide_index=True, use_container_width=True)
+                for name, err in failures:
+                    st.error(f'{name}: {err}')
+                st.session_state.pop('folder_conversion_scan', None)
+            except Exception as exc:
+                st.error(f'一括変換を開始できませんでした: {exc}')
+
+
+feature = st.radio('翻訳ツール内の機能',
+                   ['全文日本語翻訳', 'フォルダ内TXTをGoogleドキュメントに一括変換'],
+                   horizontal=True, key='translation_feature')
+if feature == 'フォルダ内TXTをGoogleドキュメントに一括変換':
+    folder_converter_page()
+    st.stop()
 
 mode=st.radio('入力方法',['TXTファイルをアップロード','Google Docs / DriveのURL'],horizontal=True)
 raw=None;filename=None
@@ -186,7 +369,32 @@ if raw is not None and filename:
     state_key='translated_'+source_id+'_'+model
     if state_key not in st.session_state:st.session_state[state_key]={}
     done=st.session_state[state_key]
+    # Legacy session values from v24 were plain strings. Preserve translations but
+    # do not invent token counts for earlier requests.
+    for _idx,_value in list(done.items()):
+        if isinstance(_value,str):
+            done[_idx]={'text':_value,'input_tokens':0,'output_tokens':0,
+                        'cached_input_tokens':0,'usage_reported':False}
+    def show_api_cost():
+        values=list(done.values())
+        input_tokens=sum(v.get('input_tokens',0) for v in values)
+        output_tokens=sum(v.get('output_tokens',0) for v in values)
+        cached_tokens=sum(v.get('cached_input_tokens',0) for v in values)
+        billable_regular=max(input_tokens-cached_tokens,0)
+        cost=(billable_regular*input_price+cached_tokens*cached_price+output_tokens*output_price)/1_000_000
+        known=sum(bool(v.get('usage_reported')) for v in values)
+        a,b,c,d=st.columns(4)
+        a.metric('入力トークン',f'{input_tokens:,}')
+        b.metric('出力トークン',f'{output_tokens:,}')
+        c.metric('推定API料金',f'${cost:.4f}')
+        d.metric('円換算（参考）',f'¥{cost*usd_jpy:,.2f}')
+        st.caption(f'実績トークン取得: {known}/{len(values)} チャンク｜キャッシュ済み入力: {cached_tokens:,} トークン。'
+                   'APIが返すusageに設定単価を掛けた推定額です。'
+                   '過去バージョンの翻訳や失敗・再試行時の課金、追加料金は含まれない場合があります。'
+                   '実際の請求額はOpenAIのUsage/Billing画面で確認してください。')
+        return cost
     st.progress(len(done)/max(len(sections),1),text=f'{len(done)}/{len(sections)} チャンク完了')
+    if done: show_api_cost()
     if st.button('全文翻訳を開始 / 続きから再開',type='primary',disabled=not key):
         bar=st.progress(len(done)/max(len(sections),1))
         status=st.empty()
@@ -197,10 +405,11 @@ if raw is not None and filename:
             except Exception as e:
                 st.error(f'チャンク{i+1}で停止: {e}。再実行で続きから再開できます。');break
             bar.progress(len(done)/len(sections))
+            show_api_cost()
         if len(done)==len(sections):st.success('全文翻訳が完了しました。')
     if done:
         complete=len(done)==len(sections)
-        rendered='\n\n'.join(done[i] for i in range(len(sections)) if i in done)
+        rendered='\n\n'.join(done[i]['text'] for i in range(len(sections)) if i in done)
         if complete:
             result=header+'\n# 本文（日本語訳）\n'+rendered+'\n'
             st.download_button('日本語訳TXTをダウンロード',result.encode('utf-8-sig'),file_name=output_name,mime='text/plain')

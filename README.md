@@ -1,13 +1,18 @@
-# IR Webcast Transcriber v23 修正内容
+# IR Webcast Transcriber v25 — 翻訳APIコスト表示
 
-1. Google Drive TXTの正しいURLでも拒否される問題を修正。`urllib.parse` によるURL判定に変更。
-2. Google Docs（`/document/d/`）・Drive TXT（`/file/d/`）・Drive `open?id=` を判定。
-3. 原文TXT内の `原本ファイル` / `原文ファイル名` を優先して出力名を決定。翻訳TXTは `Japanese_Translation_` で始まります。
-4. 元のメタデータを**変更せずにそのまま出力**（翻訳状況の古い記載も改変しないため、翻訳完了の状態はUIと本文セクションで判別）。
-5. 既存のIR Webcast文字起こしを保持。
+既存のWebcast文字起こし・全文翻訳・フォルダTXT→Googleドキュメント変換を保持。
 
-**注意**: Google Driveファイルが非公開の場合、URL判定が成功してもダウンロードには適切なOAuthアクセストークンが必要です。アクセストークンがない場合はTXTを直接アップロードできます。
+## 新機能
+- OpenAI Chat Completionsレスポンスの `usage.prompt_tokens`, `usage.completion_tokens`, `usage.prompt_tokens_details.cached_tokens` をチャンク単位で記録
+- 翻訳進行中および完了後に、入力・出力トークン、キャッシュ済み入力、推定API料金（USD/JPY）を表示
+- 料金単価はサイドバーで編集可能（USD/100万トークン）。初期値はgpt-4.1-mini参考単価：入力0.40、出力1.60、キャッシュ入力0.10
+- USD/JPYは手動入力（自動取得ではない）
+- 再開時に完了済みチャンクを再課金として二重計上しない
+- 以前のバージョンで翻訳済みのチャンクは文字列から移行し、使用量不明として表示
+- 失敗・再試行したAPIリクエストの請求が発生した場合は含まれないことがあります。請求額はOpenAI Usage/Billingが正です。
+- ファイル名は `Japanese_Translation_`、メタデータヘッダーはそのまま保持
 
-**更新**: GitHubのアプリ直下に `app.py` と `translation_page.py` を上書きし、Streamlit Cloudで再起動。
+## 更新方法
+ZIP内の `app.py`、`translation_page.py`、`requirements.txt`、`packages.txt` を既存のGitHubリポジトリ直下へ上書きし、Streamlit Cloudを再起動。
 
-**検証**: Python構文チェックとURLパーサー単体テスト実施。Google認証・OpenAI API・Streamlit Cloudの実接続は未確認。
+Python構文チェック済み。実APIでの課金計測は未検証。
