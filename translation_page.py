@@ -44,6 +44,8 @@ def fetch_google_doc(url, token=''):
     r=requests.get(f'https://docs.google.com/document/d/{doc_id}/export',params={'format':'txt'},headers=headers,timeout=45)
     if r.status_code!=200:
         raise RuntimeError(f'Googleドキュメント取得失敗（HTTP {r.status_code}）。非公開の場合はTXTをアップロードするか、OAuthアクセストークンを入力してください。')
+    if 'text/html' in r.headers.get('Content-Type','').lower():
+        raise RuntimeError('Googleログイン画面が返されました。公開設定を確認するか、TXTをアップロードしてください。')
     return r.content.decode('utf-8-sig'), f'GoogleDoc_{doc_id}.txt'
 
 
@@ -78,9 +80,18 @@ def metadata_as_japanese(header):
     if not re.search(r'(?m)^翻訳状況\s*:',header):header+='翻訳状況: 全文翻訳済み（機械翻訳・未校正）\n'
     return header
 
+def configured_api_key():
+    """Missing secrets.toml must not crash the translation page."""
+    env_key = os.environ.get('OPENAI_API_KEY', '')
+    try:
+        return st.secrets.get('OPENAI_API_KEY', env_key)
+    except Exception:
+        return env_key
+
+
 with st.sidebar:
     st.subheader('翻訳設定')
-    key=st.text_input('OpenAI APIキー',type='password',value=st.secrets.get('OPENAI_API_KEY',os.environ.get('OPENAI_API_KEY','')))
+    key=st.text_input('OpenAI APIキー',type='password',value=configured_api_key())
     model=st.text_input('モデル',value=MODEL_DEFAULT)
     extra=st.text_area('用語・翻訳上の追加指示（任意）',placeholder='例：inference=推論、ramp=量産立ち上げ')
     st.caption('APIキーはこのアプリから翻訳APIへのリクエストにのみ使用します。利用料金はAPI側で発生します。')
