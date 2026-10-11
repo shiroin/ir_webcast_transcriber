@@ -18,8 +18,8 @@ from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="IR Webcast Transcriber", page_icon="🎧", layout="centered")
 if "code" in st.query_params or "error" in st.query_params:
-    st.session_state["ir_page"] = "🌐 TXT・Google Docs 全文翻訳"
-    st.session_state["translation_feature"] = "フォルダ内TXTをGoogleドキュメントに一括変換"
+    from google_drive_integration import _google_oauth_callback
+    _google_oauth_callback()
 page = st.radio("機能を選択", ["🎧 IR Webcast 文字起こし", "🌐 TXT・Google Docs 全文翻訳"], horizontal=True, key="ir_page")
 if page == "🌐 TXT・Google Docs 全文翻訳":
     # Streamlit reruns app.py on every interaction, but Python imports are cached.
@@ -750,6 +750,23 @@ if not ffmpeg_available():
     st.error("ffmpeg が見つかりません。Streamlit Cloudでは packages.txt に ffmpeg が必要です。")
 
 translate_enabled = st.checkbox("原文と日本語訳を両方作成する（翻訳API料金が別途発生）", value=True)
+st.subheader("Google DriveへGoogleドキュメントとして保存")
+save_drive_enabled = st.checkbox(
+    "文字起こし完了後、原文と日本語訳を指定フォルダに保存する",
+    value=False, key="transcription_save_drive"
+)
+if save_drive_enabled:
+    from google_drive_integration import google_login_panel
+    google_login_panel()
+    drive_folder_url = st.text_input(
+        "保存先Google DriveフォルダのURL",key="transcription_drive_folder",
+        placeholder="https://drive.google.com/drive/u/0/folders/..."
+    )
+    st.caption("原文と日本語訳を別々のGoogleドキュメントとして作成します。"
+               "日本語訳はJapanese_Translation_を名前の先頭に付けます。")
+else:
+    drive_folder_url = ""
+
 
 with st.expander("API料金設定（概算・USD）"):
     usd_jpy = st.number_input("USD/JPY", min_value=1.0, value=150.0, step=1.0)
@@ -939,6 +956,33 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
                     use_container_width=True,
                     type="primary",
                 )
+            if save_drive_enabled:
+                st.session_state["pending_drive_transcript"] = {
+                    "original": transcript_with_tags,
+                    "translated": japanese_translation if translate_enabled else None,
+                    "original_name": f"{base_name}_transcript.txt",
+                    "translated_name": f"Japanese_Translation_{base_name}_transcript.txt",
+                    "source_url": url,
+                    "created_at": time.time(),
+                }
+                st.info("文字起こし・翻訳が完了しました。Google Driveへの自動保存を実行します。")
+                try:
+                    from google_drive_integration import parse_folder_id, upload_as_google_doc, existing_google_doc
+                    folder_id=parse_folder_id(drive_folder_url)
+                    if not st.session_state.get("google_drive_tokens"):
+                        raise RuntimeError("Googleアカウントでログインしてください。")
+                    docs_to_save=[(f"{base_name}_transcript.txt",transcript_with_tags)]
+                    if translate_enabled:
+                        docs_to_save.append((f"Japanese_Translation_{base_name}_transcript.txt",japanese_translation))
+                    for doc_filename,doc_text in docs_to_save:
+                        doc_title=doc_filename[:-4]
+                        doc=existing_google_doc(folder_id,doc_title)
+                        if not doc:
+                            doc=upload_as_google_doc(folder_id,doc_filename,doc_text)
+                        st.success(f"Google Drive保存完了: {doc_title}")
+                        st.markdown(f"[Googleドキュメントを開く](https://docs.google.com/document/d/{doc['id']}/edit)")
+                except Exception as drive_exc:
+                    st.warning(f"自動保存できませんでした: {drive_exc}。下部から再試行できます。")
             transcription_cost = billed_audio_minutes * transcribe_usd_min
             translation_cost = (
                 translation_usage["input_tokens"] * translation_in_per_m
@@ -981,6 +1025,44 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
     except Exception as e:
         st.error("処理に失敗しました。")
         st.code(str(e))
+
+# Render outside the transcription button so a Streamlit rerun never starts
+# another paid transcription just to upload previously generated results.
+if st.session_state.get("pending_drive_transcript"):
+    result=st.session_state["pending_drive_transcript"]
+    st.divider()
+    st.subheader("Google Driveにアップロード")
+    st.write("原文:",result["original_name"])
+    if result["translated"] is not None:
+        st.write("日本語訳:",result["translated_name"])
+    else:
+        st.warning("日本語訳は未生成です。原文のみ保存します。")
+    from google_drive_integration import parse_folder_id, upload_as_google_doc, existing_google_doc
+    folder_for_upload=st.text_input("保存先フォルダURL",value=st.session_state.get("transcription_drive_folder",""),
+                                    key="transcription_upload_folder")
+    if st.button("Google Driveにアップロード",type="primary",key="upload_transcripts_drive"):
+        try:
+            folder_id=parse_folder_id(folder_for_upload)
+            if not st.session_state.get("google_drive_tokens"):
+                raise RuntimeError("先にGoogleアカウントでログインしてください。")
+            items=[(result["original_name"],result["original"])]
+            if result["translated"] is not None:
+                items.append((result["translated_name"],result["translated"]))
+            for filename,content in items:
+                title=filename[:-4] if filename.endswith(".txt") else filename
+                existing=existing_google_doc(folder_id,title)
+                if existing:
+                    doc=existing
+                    st.info(f"同名のGoogleドキュメントがあるためスキップ: {title}")
+                else:
+                    doc=upload_as_google_doc(folder_id,filename,content)
+                doc_id=doc["id"]
+                st.success(f"保存済み: {title}")
+                st.markdown(f"[Googleドキュメントを開く](https://docs.google.com/document/d/{doc_id}/edit)")
+        except Exception as exc:
+            st.error(f"アップロードに失敗しました: {exc}")
+    st.caption("アップロードに失敗しても翻訳を再実行する必要はありません。"
+               "この画面の結果から再試行できます。同名のGoogleドキュメントは再作成しません。")
 
 with st.expander("対応機能"):
     st.markdown("""
