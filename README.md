@@ -1,24 +1,16 @@
-# IR Webcast Transcriber v30 — 文字起こし・日本語訳をGoogle Docsで自動保存
+# IR Webcast Transcriber v31
 
-## 使い方
-1. ZIP内の `app.py`、`translation_page.py`、`google_drive_integration.py`、`requirements.txt`、`packages.txt` をGitHubリポジトリ直下に配置し、Streamlit Cloudを再デプロイ。
-2. 既存のStreamlit Secretsに `OPENAI_API_KEY` と、Google OAuth用の `GOOGLE_CLIENT_ID`、`GOOGLE_CLIENT_SECRET`、`GOOGLE_REDIRECT_URI`、`GOOGLE_OAUTH_STATE_SECRET` を設定。
-3. 「🎧 IR Webcast 文字起こし」画面で「原文と日本語訳を両方作成する」をオン。
-4. 「文字起こし完了後、原文と日本語訳を指定フォルダに保存する」をオン。Googleアカウントでログイン。
-5. Google DriveフォルダURLを入力し、「文字起こし開始」。
-6. 文字起こし・翻訳が完了すると、Google Driveフォルダ直下に以下の2つの**ネイティブGoogleドキュメント**を自動作成：
-   - `<企業名>_<決算期>_<日付>_transcript`
-   - `Japanese_Translation_<企業名>_<決算期>_<日付>_transcript`
-   Google Docsは拡張子 `.txt` を付けずに作成します。
-7. 自動保存に失敗した場合は画面下部の「Google Driveにアップロード」で再試行。再翻訳・再文字起こし不要。既存同名Googleドキュメントは重複作成せずスキップ。
+PDF → メタデータ付き原文TXT → 全文日本語翻訳 → Google Driveに原文・日本語訳をネイティブGoogleドキュメントとして保存。
 
-## 注意
-- 保存先URLは `https://drive.google.com/drive/u/0/folders/<ID>` など。
-- GoogleログインにはDrive全体へのアクセス権限 `https://www.googleapis.com/auth/drive` が必要です。共有フォルダではログインしたアカウントに書き込み権限が必要です。
-- 「日本語訳を作成する」がオフなら原文のみ保存。
-- 元のTXT形式と同じメタデータヘッダーを両方のGoogle Docs本文に含めます。Google Docsへのインポートは表示上の段落・書式を変える場合があります。
-- 自動保存は文字起こし・翻訳が正常に完了した後に行われます。
-- OAuthトークンはStreamlitのセッション内に保持。秘密鍵はGitHubにアップロードしないでください。
-- `google_drive_integration.py` を必ず一緒にデプロイしてください。
-- Google APIへの書き込みを実行するため、Google側の権限設定・OAuth同意画面が必要です。
-- Python構文チェック済み。Google OAuthとDrive APIの実接続は未検証。
+デフォルト画面は「PDF → 全文翻訳 → Google Drive」です。企業名、決算期、Event Dateを必須入力します。翻訳のチャンク再開、トークン使用量・概算API料金表示、Googleログイン、指定フォルダ保存に対応します。原文とJapanese_Translation_付きの日本語訳をGoogle Docsで作成します。同名のドキュメントはスキップします。
+
+ZIP内の全ファイルをGitHubリポジトリ直下へ配置し、Streamlit Cloudで再デプロイしてください。新規ファイル pdf_pipeline.py と translation_core.py も必須です。
+
+Google CloudのOAuthクライアントに次のリダイレクトURIを登録し、Streamlit Cloud SecretsのGOOGLE_REDIRECT_URIにも完全一致で設定します：
+https://irwebcasttranscriber-2ytgsid2pfpmajk8qrvqvv.streamlit.app/
+
+必要なSecrets: OPENAI_API_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, GOOGLE_OAUTH_STATE_SECRET。Google Drive API有効化・保存先フォルダへの書き込み権限も必要です。
+
+PDF文字抽出はPyMuPDF（OCRなし）。画像PDFや複雑な表は抽出できない場合があります。Event Dateは自動推測せず手入力します。PDF変換は無料ですがOpenAI翻訳は従量課金です。翻訳開始とDrive保存はそれぞれボタンを押します。
+
+Python構文チェック済み。実Google OAuth/Drive書き込みと本番Streamlit Cloud上の動作は未検証です。URL先の公開アプリはZIPをデプロイするまで更新されません。
