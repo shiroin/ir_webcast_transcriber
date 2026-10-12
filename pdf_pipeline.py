@@ -40,6 +40,19 @@ def make_original(pdf_bytes, filename, metadata, page_breaks=True):
     return original, header, parsed_body, [i for i,p in enumerate(pages,1) if not p]
 
 
+def metadata_filename(metadata, include_title=False):
+    """Build a stable, human-readable document name from user metadata."""
+    def safe(value):
+        value = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', '_', str(value or '').strip())
+        value = re.sub(r'\s+', '_', value)
+        value = re.sub(r'_+', '_', value).strip('._ ')
+        return value[:90].rstrip('._ ')
+    fields = [safe(metadata.get(k)) for k in ('company','period','event_date')]
+    if include_title and safe(metadata.get('title')):
+        fields.append(safe(metadata['title']))
+    return '_'.join(part for part in fields if part) or 'Transcript'
+
+
 def main():
     st.title('📄 PDF決算スクリプト → 日本語訳 → Google Drive')
     st.caption('PDFからメタデータ付き原文を作成し、全文日本語訳を生成。原文と日本語訳をGoogleドキュメント形式で保存します。')
@@ -78,9 +91,11 @@ def main():
         st.warning(f'文字を抽出できなかったページがあります: {empty_pages[:20]}。スキャン部分はOCRが必要です。')
     with st.expander('原文・メタデータをプレビュー',expanded=False):
         st.code(original[:6000],language='text')
-    base = re.sub(r'[^\w.-]+','_',Path(pdf.name).stem,flags=re.UNICODE).strip('_') or 'Transcript'
-    original_filename = base + '_original.txt'
-    translated_filename = 'Japanese_Translation_' + base + '_original.txt'
+    include_title=st.checkbox('ファイル名に資料タイトルも含める',value=False,key='p_filename_title_'+fingerprint)
+    base = metadata_filename(metadata,include_title)
+    original_filename = base + '_Original.txt'
+    translated_filename = 'Japanese_Translation_' + base + '_Original.txt'
+    st.caption(f'原文ファイル名: {original_filename} ／ 日本語訳ファイル名: {translated_filename}')
     st.download_button('原文TXTをダウンロード',original.encode('utf-8-sig'),original_filename,'text/plain')
     st.subheader('③ 全文日本語翻訳')
     def secret(name,default=''):
@@ -123,15 +138,12 @@ def main():
     st.subheader('④ Google Driveに原文・日本語訳を保存')
     google_login_panel()
     folder_url=st.text_input('保存先Google DriveフォルダURL',key='pdf_drive_folder',placeholder='https://drive.google.com/drive/u/0/folders/...')
-    st.caption('両方ともGoogleドキュメント形式で保存します。TXTファイルをDriveに置くのではありません。')
+    st.caption('両方ともGoogleドキュメント形式で保存します。TXTファイルをDriveに置くのではありません。同名ドキュメントが既にある場合は上書きせずスキップします。')
     if st.button('原文・日本語訳をGoogleドキュメントで保存',type='primary',disabled=not complete or not folder_url.strip() or not st.session_state.get('google_drive_tokens') or not all((company.strip(),period.strip(),event_date.strip())),key='pdf_save_docs'):
         try:
             folder_id=parse_folder_id(folder_url)
-            # Include a short content fingerprint in the title to avoid silently reusing a
-            # stale Google Doc from a previous run of a similarly named PDF.
-            suffix=hashlib.sha256(original.encode()).hexdigest()[:8]
             for filename,text in ((original_filename,original),(translated_filename,translated)):
-                doc_name=Path(filename).stem+'_'+suffix
+                doc_name=Path(filename).stem
                 existing=existing_google_doc(folder_id,doc_name)
                 doc=existing if existing else upload_as_google_doc(folder_id,doc_name+'.txt',text)
                 st.success(f'{"既存" if existing else "作成"}: {doc_name}')
