@@ -20,10 +20,14 @@ st.set_page_config(page_title="IR Webcast Transcriber", page_icon="🎧", layout
 if "code" in st.query_params or "error" in st.query_params:
     from google_drive_integration import _google_oauth_callback
     _google_oauth_callback()
-page = st.radio("機能を選択", ["📄 PDF → 全文翻訳 → Google Drive", "🎧 IR Webcast 文字起こし", "🌐 TXT・Google Docs 全文翻訳"], horizontal=True, key="ir_page")
+page = st.radio("機能を選択", ["📄 PDF → 全文翻訳 → Google Drive", "📑 Earnings + Follow-up 統合", "🎧 IR Webcast 文字起こし", "🌐 TXT・Google Docs 全文翻訳"], horizontal=True, key="ir_page")
 if page == "📄 PDF → 全文翻訳 → Google Drive":
     from pdf_pipeline import main as pdf_pipeline_main
     pdf_pipeline_main()
+    st.stop()
+if page == "📑 Earnings + Follow-up 統合":
+    from merge_calls import main as merge_calls_main
+    merge_calls_main()
     st.stop()
 if page == "🌐 TXT・Google Docs 全文翻訳":
     # Streamlit reruns app.py on every interaction, but Python imports are cached.
