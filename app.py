@@ -409,16 +409,46 @@ def ffmpeg_get(url, out_path):
 
 
 def yt_dlp_audio_get(url, out_path):
-    """YouTube等: yt-dlpに音声抽出まで任せる従来ルート。"""
-    template = str(out_path.with_suffix(".%(ext)s"))
-    run([
-        sys.executable, "-m", "yt_dlp", "--no-playlist", "-x",
-        "--audio-format", "mp3", "--audio-quality", "5", "-o", template, url,
-    ])
-    candidates = list(out_path.parent.glob(out_path.stem + ".mp3"))
-    if not candidates:
-        raise RuntimeError("yt-dlpで音声ファイルを作成できませんでした。公開範囲・ログイン・埋め込み制限を確認してください。")
-    return candidates[0]
+    """YouTube: use supported JS runtime, EJS, bounded retries and diagnostics."""
+    from youtube_runtime import youtube_js_args
+    js_args, js_description = youtube_js_args()
+    template = str(out_path.with_suffix('.%(ext)s'))
+    # Normalize mobile YouTube URLs, remove tracking parameters.
+    from urllib.parse import parse_qs
+    parsed = urlparse(url)
+    if 'youtu.be' in parsed.netloc.lower():
+        video_id = parsed.path.strip('/').split('/')[0]
+    else:
+        video_id = parse_qs(parsed.query).get('v', [''])[0]
+    if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
+        raise RuntimeError('YouTubeの動画IDをURLから取得できませんでした。')
+    normalized_url = 'https://www.youtube.com/watch?v=' + video_id
+    errors = []
+    # Do not use format IDs or bypasses that depend on undocumented clients.
+    for attempt in range(2):
+        cmd = [sys.executable, '-m', 'yt_dlp', '--no-playlist',
+               '--no-config', '--no-progress', '--socket-timeout', '25',
+               '--retries', '2', '--fragment-retries', '2',
+               '--extractor-retries', '2', '--no-part',
+               *js_args, '-f', 'bestaudio/best', '-x',
+               '--audio-format', 'mp3', '--audio-quality', '5',
+               '-o', template, normalized_url]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+            if p.returncode == 0 and out_path.is_file() and out_path.stat().st_size > 0:
+                return out_path
+            message = (p.stderr or p.stdout or '音声が生成されませんでした')[-2000:]
+            errors.append(message)
+            if '403' in message or 'Sign in' in message or 'bot' in message.lower():
+                # Retrying the same request will not fix IP/access restrictions.
+                break
+        except subprocess.TimeoutExpired:
+            errors.append('YouTube音声取得が15分でタイムアウトしました')
+        out_path.unlink(missing_ok=True)
+    raise RuntimeError('YouTubeの音声取得に失敗しました。JS環境: '+js_description+'。\n'
+                       +'\n'.join(errors[-2:])+'\n'
+                       +'403が続く場合、Streamlit Cloudの共有IPに対するYouTube側の制限の可能性があります。'
+                       +'JS環境だけでは解除できません。')
 
 
 def vimeo_audio_get(url, out_path):
