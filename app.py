@@ -38,7 +38,7 @@ if page == "🌐 TXT・Google Docs 全文翻訳":
     st.stop()
 
 st.title("🎧 IR Webcast Transcriber")
-st.caption("音声取得はStreamlit、文字起こしは外部API。YouTube / Vimeo / SmartVision IR / Q4字幕M3U8 / MP3 / M3U8 / TS / IR webcastページ / IR Webcasting、英・中・韓・日に対応。")
+st.caption("音声取得はStreamlit、文字起こしは外部API。YouTube / Vimeo / SmartVision IR / Q4録画リンク / Q4字幕M3U8 / MP3 / M3U8 / TS / IR webcastページ / IR Webcasting、英・中・韓・日に対応。")
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36"
 OPENAI_TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions"
@@ -64,6 +64,73 @@ def kind(url):
     return None
 
 
+
+
+def is_q4_recording_link(url):
+    """Q4 static.events recording URLs often have no media file extension."""
+    parsed = urlparse(url)
+    return (parsed.scheme in ("http", "https")
+            and parsed.hostname == "static.events.q4inc.com"
+            and re.search(r"/videos/[^/]+/videoRecordingLink[^/]*$", parsed.path, re.I) is not None)
+
+
+def q4_recording_audio_get(url, out_path):
+    """Resolve extensionless Q4 recording links without treating media as HTML.
+
+    Q4 may redirect to MP4, HLS, audio, or return media with a Content-Type.
+    Prefer ffmpeg for streams; use yt-dlp as a fallback for provider pages.
+    """
+    headers = {"User-Agent": UA, "Accept": "*/*"}
+    resolved_url = url
+    content_type = ""
+    try:
+        with requests.get(url, headers=headers, allow_redirects=True,
+                          stream=True, timeout=(15, 30)) as response:
+            response.raise_for_status()
+            resolved_url = response.url
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower().strip()
+            # Close without consuming the whole video: ffmpeg streams the source.
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Q4録画リンクの取得に失敗しました: {exc}") from exc
+
+    if is_caption_m3u8(resolved_url):
+        raise RuntimeError("字幕のみのM3U8です。字幕取得ルートをご利用ください。")
+
+    # HTML player / JSON descriptor needs media discovery or yt-dlp, not ffmpeg.
+    is_page = content_type in ("text/html", "application/xhtml+xml", "application/json")
+    errors = []
+    if not is_page:
+        try:
+            ffmpeg_get(resolved_url, out_path)
+            if out_path.is_file() and out_path.stat().st_size > 0:
+                return out_path
+            raise RuntimeError("音声ファイルが空です")
+        except Exception as exc:
+            errors.append(f"ffmpeg: {str(exc)[-650:]}")
+            out_path.unlink(missing_ok=True)
+    if is_page:
+        try:
+            candidates, _ = discover_nested_player_media(resolved_url, max_depth=2)
+            if not candidates:
+                candidates = discover_media(resolved_url)
+            for media in candidates[:8]:
+                try:
+                    ffmpeg_get(media, out_path)
+                    if out_path.is_file() and out_path.stat().st_size > 0:
+                        return out_path
+                except Exception as exc:
+                    errors.append(f"player media: {str(exc)[-250:]}")
+                    out_path.unlink(missing_ok=True)
+        except Exception as exc:
+            errors.append(f"player discovery: {str(exc)[-450:]}")
+    if yt_dlp_available():
+        for candidate in dict.fromkeys((resolved_url, url)):
+            try:
+                return yt_dlp_audio_get(candidate, out_path)
+            except Exception as exc:
+                errors.append(f"yt-dlp: {str(exc)[-650:]}")
+    raise RuntimeError("Q4録画リンクから音声を取得できませんでした。"
+                       "アクセス制限・配信期限・DRMの可能性があります。\n" + "\n".join(errors[-4:]))
 
 
 def is_caption_m3u8(url):
@@ -144,25 +211,11 @@ def ffmpeg_available():
 
 
 def ffmpeg_get(url, out_path):
-    """Extract audio with bounded CPU/RAM and disk output (never buffer MP4 in Python)."""
-    cmd = [
-        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
-        "-threads", "1",
-    ]
-    if str(url).startswith(("https://", "http://")):
-        cmd += ["-user_agent", UA, "-rw_timeout", "30000000"]
-    cmd += [
-        "-i", str(url), "-map", "0:a:0", "-vn", "-sn", "-dn",
-        "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame",
-        "-b:a", "32k", "-threads", "1", str(out_path),
-    ]
-    try:
-        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                           text=True, timeout=3600)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("動画からの音声抽出が60分を超えたため停止しました。")
-    if p.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
-        raise RuntimeError("MP4等の音声抽出に失敗しました。音声トラックやURLを確認してください。\n" + (p.stderr or "")[-2500:])
+    run([
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-user_agent", UA, "-i", url,
+        "-vn", "-c:a", "libmp3lame", "-b:a", "64k", str(out_path),
+    ])
     return out_path
 
 
@@ -697,7 +750,7 @@ def safe_filename(text):
     return text[:80] or "untagged"
 
 
-url = st.text_input("URL", placeholder="YouTube / Vimeo / .mp3 / .m3u8 / .ts / IR Webcasting / Chorus Call / teletogether 等")
+url = st.text_input("URL", placeholder="YouTube / Vimeo / Q4 videoRecordingLink / .mp3 / .m3u8 / .ts / IR Webcasting 等")
 
 auto_meta = {"company":"", "period":"", "date":""}
 if url.strip() and is_irwebcasting(url.strip()):
@@ -706,7 +759,7 @@ if url.strip() and is_irwebcasting(url.strip()):
         st.caption("IR Webcastingを検出：企業名・決算期・説明会日を自動取得します。")
     except Exception as e:
         st.caption(f"IR Webcastingのタグ自動取得に失敗しました（手入力は可能です）: {e}")
-elif url.strip() and kind(url.strip()) is None:
+elif url.strip():
     # SmartVisionを含む一般IR動画ページでもタグをbest-effort取得。
     try:
         auto_meta = extract_generic_ir_metadata(url.strip())
@@ -804,7 +857,7 @@ def display_cost_history():
     if not st.session_state.cost_history:
         return
     st.subheader("今回のセッションのAPI費用履歴")
-    st.dataframe(st.session_state.cost_history, width="stretch")
+    st.dataframe(st.session_state.cost_history, use_container_width=True)
     csv_buf = io.StringIO()
     writer = csv.DictWriter(csv_buf, fieldnames=list(st.session_state.cost_history[0].keys()))
     writer.writeheader()
@@ -836,7 +889,11 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
             direct_caption_text = None
             source_kind = kind(url)
 
-            if is_caption_m3u8(url):
+            if is_q4_recording_link(url):
+                status.info("Q4録画リンクを解析中…（リダイレクト・動画形式を自動判定）")
+                audio = q4_recording_audio_get(url, audio)
+                source = "Q4 recording link"
+            elif is_caption_m3u8(url):
                 status.info("字幕M3U8を検出。音声ではなく既存WebVTT字幕を直接取得中…")
                 direct_caption_text = caption_m3u8_to_text(url)
                 source = "Q4/HLS subtitles"
@@ -1037,7 +1094,11 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
                 f"{base_name}_transcript.txt", "text/plain", use_container_width=True,
             )
             if direct_caption_text is None and audio.exists():
-                st.caption("大容量MP3のメモリ読み込みを避けるため、MP3のダウンロードは省略しています。原文と日本語訳はTXT/ZIPで取得できます。")
+                with open(audio, "rb") as af:
+                    audio_bytes = af.read()
+                st.download_button(
+                    "MP3もダウンロード", audio_bytes, f"{base_name}.mp3", "audio/mpeg", use_container_width=True,
+                )
             elif direct_caption_text is not None:
                 st.caption("このURLは字幕ストリームのためMP3はありません。音声が必要な場合はaudio/video側のm3u8を貼ってください。")
     except Exception as e:

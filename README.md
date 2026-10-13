@@ -27,3 +27,10 @@ ZIP内の `app.py`, `pdf_pipeline.py`, `merge_calls.py`, `workflow_utils.py`, `g
 - 同名のGoogleドキュメントがある場合は上書きせず、内容更新は行いません。
 - スキャンPDFはOCR非対応です。
 - Python構文チェックとZIP検証済み。Google API/OpenAI APIへの実接続は未検証です。
+
+## v36: Q4拡張子なし録画リンク対応
+- `https://static.events.q4inc.com/.../videos/.../videoRecordingLink...` を音声・動画取得対象として認識。
+- HTTPリダイレクト先とContent-Typeを確認し、動画・音声・HLSをffmpegでMP3化。HTMLプレイヤーの場合は埋め込みメディアを探索し、yt-dlpでも再試行。
+- 既存の文字起こし・日本語翻訳・Google Drive自動保存フローへ接続。
+- 使い方: 「🎧 IR Webcast 文字起こし」→録画URLを入力→「文字起こし開始」。
+- 配信元URLの実際の応答はこの環境から確認できていないため、ライブ動作は未検証。認証・DRM・配信期限がある場合は取得できません。
