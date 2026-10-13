@@ -144,11 +144,25 @@ def ffmpeg_available():
 
 
 def ffmpeg_get(url, out_path):
-    run([
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-user_agent", UA, "-i", url,
-        "-vn", "-c:a", "libmp3lame", "-b:a", "64k", str(out_path),
-    ])
+    """Extract audio with bounded CPU/RAM and disk output (never buffer MP4 in Python)."""
+    cmd = [
+        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+        "-threads", "1",
+    ]
+    if str(url).startswith(("https://", "http://")):
+        cmd += ["-user_agent", UA, "-rw_timeout", "30000000"]
+    cmd += [
+        "-i", str(url), "-map", "0:a:0", "-vn", "-sn", "-dn",
+        "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame",
+        "-b:a", "32k", "-threads", "1", str(out_path),
+    ]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                           text=True, timeout=3600)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("動画からの音声抽出が60分を超えたため停止しました。")
+    if p.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
+        raise RuntimeError("MP4等の音声抽出に失敗しました。音声トラックやURLを確認してください。\n" + (p.stderr or "")[-2500:])
     return out_path
 
 
@@ -692,7 +706,7 @@ if url.strip() and is_irwebcasting(url.strip()):
         st.caption("IR Webcastingを検出：企業名・決算期・説明会日を自動取得します。")
     except Exception as e:
         st.caption(f"IR Webcastingのタグ自動取得に失敗しました（手入力は可能です）: {e}")
-elif url.strip():
+elif url.strip() and kind(url.strip()) is None:
     # SmartVisionを含む一般IR動画ページでもタグをbest-effort取得。
     try:
         auto_meta = extract_generic_ir_metadata(url.strip())
@@ -790,7 +804,7 @@ def display_cost_history():
     if not st.session_state.cost_history:
         return
     st.subheader("今回のセッションのAPI費用履歴")
-    st.dataframe(st.session_state.cost_history, use_container_width=True)
+    st.dataframe(st.session_state.cost_history, width="stretch")
     csv_buf = io.StringIO()
     writer = csv.DictWriter(csv_buf, fieldnames=list(st.session_state.cost_history[0].keys()))
     writer.writeheader()
@@ -1023,11 +1037,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
                 f"{base_name}_transcript.txt", "text/plain", use_container_width=True,
             )
             if direct_caption_text is None and audio.exists():
-                with open(audio, "rb") as af:
-                    audio_bytes = af.read()
-                st.download_button(
-                    "MP3もダウンロード", audio_bytes, f"{base_name}.mp3", "audio/mpeg", use_container_width=True,
-                )
+                st.caption("大容量MP3のメモリ読み込みを避けるため、MP3のダウンロードは省略しています。原文と日本語訳はTXT/ZIPで取得できます。")
             elif direct_caption_text is not None:
                 st.caption("このURLは字幕ストリームのためMP3はありません。音声が必要な場合はaudio/video側のm3u8を貼ってください。")
     except Exception as e:
