@@ -36,8 +36,15 @@ _startup_log.info("OAuth callback check completed; rendering page selector")
 page = st.radio("機能を選択", ["📄 PDF → 全文翻訳 → Google Drive", "📑 Earnings + Follow-up 統合", "🎧 IR Webcast 文字起こし", "🌐 TXT・Google Docs 全文翻訳"], horizontal=True, key="ir_page")
 _startup_log.info("page selector rendered; selected section: %s", ["PDF", "Merge", "Transcription", "Translation"][["📄 PDF → 全文翻訳 → Google Drive", "📑 Earnings + Follow-up 統合", "🎧 IR Webcast 文字起こし", "🌐 TXT・Google Docs 全文翻訳"].index(page)])
 if page == "📄 PDF → 全文翻訳 → Google Drive":
+    _startup_log.info("PDF: before importing pdf_pipeline")
     from pdf_pipeline import main as pdf_pipeline_main
-    pdf_pipeline_main()
+    _startup_log.info("PDF: import completed; before main()")
+    try:
+        pdf_pipeline_main()
+    except Exception:
+        _startup_log.exception("PDF: main() raised an exception")
+        raise
+    _startup_log.info("PDF: main() completed")
     st.stop()
 if page == "📑 Earnings + Follow-up 統合":
     from merge_calls import main as merge_calls_main
