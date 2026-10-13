@@ -412,7 +412,7 @@ def folder_converter_page():
         st.write(f'TXT: {len(rows)}件｜変換対象: {len(pending)}件｜既存の同名Googleドキュメント: {len(rows)-len(pending)}件')
         if rows:
             st.dataframe([{'元TXT': r['source'], '変換後Googleドキュメント': r['target'], '状態': r['status']} for r in rows],
-                         width="stretch", hide_index=True)
+                         use_container_width=True, hide_index=True)
         confirm = st.checkbox('対象TXTをGoogleドキュメントとして新規作成する（元TXTは保持）', key='convert_confirm')
         if st.button('一括変換を実行', type='primary', disabled=not (pending and confirm), key='convert_execute'):
             try:
@@ -443,7 +443,7 @@ def folder_converter_page():
                 st.success(f'変換完了: {len(successes)}件。スキップ: {len(skipped)}件。エラー: {len(failures)}件。')
                 if successes:
                     st.dataframe([{'元TXT': name, 'Googleドキュメント': f'https://docs.google.com/document/d/{fid}/edit'}
-                                  for name, fid in successes], hide_index=True, width="stretch")
+                                  for name, fid in successes], hide_index=True, use_container_width=True)
                 for name, err in failures:
                     st.error(f'{name}: {err}')
                 st.session_state.pop('folder_conversion_scan', None)

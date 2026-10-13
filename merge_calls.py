@@ -8,6 +8,7 @@ import streamlit as st
 from google_drive_integration import google_login_panel, parse_folder_id, existing_google_doc, upload_as_google_doc
 from pdf_pipeline import metadata_filename
 from translation_core import split_metadata, chunks, translate_chunk
+from workflow_utils import persistent_text, auto_save_documents
 
 
 def read_source(upload):
@@ -76,6 +77,11 @@ def main():
     st.title("📑 Earnings Call + Follow-up Call 統合")
     st.caption("Earnings Call → Follow-up Callの順に全文を統合し、日本語に全文翻訳。"
                "原文とJapanese_Translation_付き日本語訳の2つをGoogleドキュメント形式で保存します。")
+    st.subheader("Google Drive接続・保存先設定")
+    google_login_panel()
+    folder_url=persistent_text("保存先Google DriveフォルダURL", "merge_folder",
+        placeholder="https://drive.google.com/drive/u/0/folders/...")
+    st.caption("保存先URLは次のファイルでも引き継がれます。翻訳完了後、自動保存します。")
     left, right = st.columns(2)
     with left:
         earnings_file = st.file_uploader("① Earnings Call（TXT / PDF）", type=["txt", "pdf"], key="merge_earnings")
@@ -99,10 +105,10 @@ def main():
     st.subheader("③ 統合メタデータ")
     a, b = st.columns(2)
     with a:
-        company = st.text_input("企業名（必須）", key="merge_company_"+fingerprint, placeholder="NVIDIA")
-        period = st.text_input("決算期（必須）", key="merge_period_"+fingerprint, placeholder="FY2027 Q2")
+        company = persistent_text("企業名（必須）", key="merge_company", placeholder="NVIDIA")
+        period = persistent_text("決算期（必須）", key="merge_period", placeholder="FY2027 Q2")
     with b:
-        event_date = st.text_input("Event Date（必須）", key="merge_date_"+fingerprint, placeholder="2026-08-26")
+        event_date = persistent_text("Event Date（必須）", key="merge_date", placeholder="2026-08-26")
     metadata = {"company": company, "period": period, "event_date": event_date}
     combined = build_combined(
         {"name": earnings_file.name, "header": e_header, "body": e_body},
@@ -138,7 +144,7 @@ def main():
     original_header, original_body, _=split_metadata(combined)
     parts=chunks(original_body)
     # Changes to the uploaded files, metadata or model start a separate translation job.
-    job_id=hashlib.sha256((combined+"\\0"+model).encode("utf-8")).hexdigest()
+    job_id=hashlib.sha256((combined+"\0"+model).encode("utf-8")).hexdigest()
     done=st.session_state.setdefault("merge_translation_"+job_id,{})
     st.caption(f"統合本文 {len(original_body):,}文字 / {len(parts)}チャンク。"
                "途中で停止しても同じ入力・設定で再開できます。")
@@ -176,33 +182,21 @@ def main():
     st.caption(f"原文: {name} ／ 日本語訳: {translated_name}")
     if complete:
         # Preserve combined metadata byte-for-byte, translating the body only.
-        translated=original_header+"\\n\\n# 本文（日本語訳）\\n\\n"+(
-            "\\n\\n".join(done[i]["text"] for i in range(len(parts)))
-        )+"\\n"
+        translated=original_header+"\n\n# 本文（日本語訳）\n\n"+(
+            "\n\n".join(done[i]["text"] for i in range(len(parts)))
+        )+"\n"
         st.success("統合全文の日本語翻訳が完了しました。")
         st.download_button("統合日本語訳TXTをダウンロード",
                            translated.encode("utf-8-sig"),
                            file_name=translated_name+".txt",mime="text/plain")
-    st.subheader("⑤ Google Driveに原文・日本語訳を保存")
-    google_login_panel()
-    folder_url=st.text_input("保存先Google DriveフォルダURL",key="merge_folder",
-                              placeholder="https://drive.google.com/drive/u/0/folders/...")
-    st.caption("2つともネイティブGoogleドキュメント形式で保存します。"
-               "同名ドキュメントは上書きせずスキップします。")
-    if st.button("原文と日本語訳の2つをGoogleドキュメントで保存",type="primary",
-                 disabled=not (complete and company.strip() and period.strip()
-                               and event_date.strip() and folder_url.strip()
-                               and st.session_state.get("google_drive_tokens")),
-                 key="merge_save"):
-        try:
-            folder_id=parse_folder_id(folder_url)
-            for doc_name,content in ((name,combined),(translated_name,translated)):
-                existing=existing_google_doc(folder_id,doc_name)
-                doc=existing or upload_as_google_doc(folder_id,doc_name+".txt",content)
-                st.success(f'{"既存（スキップ）" if existing else "作成"}: {doc_name}')
-                st.markdown(f"[Googleドキュメントを開く](https://docs.google.com/document/d/{doc['id']}/edit)")
-        except Exception as exc:
-            st.error(f"Google Driveへの保存に失敗しました: {exc}。翻訳し直さず再試行できます。")
+    st.subheader("⑤ Google Driveへ自動保存")
+    if complete:
+        docs = ((name, combined), (translated_name, translated))
+        auto_save_documents(folder_url, docs, job_id)
+        if st.button("保存のみ再試行", key="merge_autosave_retry"):
+            auto_save_documents(folder_url, docs, job_id, retry=True)
+    else:
+        st.caption("翻訳完了後、指定したフォルダに原文と日本語訳を自動アップロードします。")
 
 
 if __name__ == "__main__":

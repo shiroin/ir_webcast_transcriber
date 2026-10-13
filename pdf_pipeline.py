@@ -6,6 +6,7 @@ from pathlib import Path
 import streamlit as st
 import fitz
 from google_drive_integration import google_login_panel, parse_folder_id, existing_google_doc, upload_as_google_doc
+from workflow_utils import persistent_text, auto_save_documents
 from translation_core import chunks, translate_chunk, split_metadata
 
 
@@ -56,6 +57,11 @@ def metadata_filename(metadata, include_title=False):
 def main():
     st.title('📄 PDF決算スクリプト → 日本語訳 → Google Drive')
     st.caption('PDFからメタデータ付き原文を作成し、全文日本語訳を生成。原文と日本語訳をGoogleドキュメント形式で保存します。')
+    st.subheader('Google Drive接続・保存先設定')
+    google_login_panel()
+    folder_url=persistent_text('保存先Google DriveフォルダURL',key='pdf_drive_folder',
+        placeholder='https://drive.google.com/drive/u/0/folders/...')
+    st.caption('保存先URLは次のPDFでも引き継がれます。翻訳完了後に自動保存します。')
     pdf = st.file_uploader('① PDFファイルをアップロード',type=['pdf'],key='pdf_pipeline_file')
     if pdf is None:
         st.info('まずNVIDIAなどの決算スクリプトPDFをアップロードしてください。')
@@ -74,10 +80,10 @@ def main():
     st.caption('Event Dateは必須です。日付は自動推測せず、入力した値を原文と日本語訳の両方に記録します。')
     a,b=st.columns(2)
     with a:
-        company=st.text_input('企業名（必須）',key='p_company_'+fingerprint,placeholder='NVIDIA')
-        period=st.text_input('決算期（必須）',key='p_period_'+fingerprint,placeholder='FY2027 Q2')
+        company=persistent_text('企業名（必須）',key='p_company',placeholder='NVIDIA')
+        period=persistent_text('決算期（必須）',key='p_period',placeholder='FY2027 Q2')
     with b:
-        event_date=st.text_input('Event Date（必須）',key='p_date_'+fingerprint,placeholder='2026-08-26')
+        event_date=persistent_text('Event Date（必須）',key='p_date',placeholder='2026-08-26')
         title=st.text_input('資料タイトル',value=pdf_title,key='p_title_'+fingerprint)
     url=st.text_input('PDF原本URL（任意）',key='p_url_'+fingerprint)
     page_breaks=st.checkbox('ページ区切りを残す',value=True,key='p_page_'+fingerprint)
@@ -135,21 +141,15 @@ def main():
         translated=header+'\n\n# 本文（日本語訳）\n\n'+'\n\n'.join(done[i]['text'] for i in range(len(parts)))+'\n'
         st.success('全文翻訳が完了しました。')
         st.download_button('日本語訳TXTをダウンロード',translated.encode('utf-8-sig'),translated_filename,'text/plain')
-    st.subheader('④ Google Driveに原文・日本語訳を保存')
-    google_login_panel()
-    folder_url=st.text_input('保存先Google DriveフォルダURL',key='pdf_drive_folder',placeholder='https://drive.google.com/drive/u/0/folders/...')
-    st.caption('両方ともGoogleドキュメント形式で保存します。TXTファイルをDriveに置くのではありません。同名ドキュメントが既にある場合は上書きせずスキップします。')
-    if st.button('原文・日本語訳をGoogleドキュメントで保存',type='primary',disabled=not complete or not folder_url.strip() or not st.session_state.get('google_drive_tokens') or not all((company.strip(),period.strip(),event_date.strip())),key='pdf_save_docs'):
-        try:
-            folder_id=parse_folder_id(folder_url)
-            for filename,text in ((original_filename,original),(translated_filename,translated)):
-                doc_name=Path(filename).stem
-                existing=existing_google_doc(folder_id,doc_name)
-                doc=existing if existing else upload_as_google_doc(folder_id,doc_name+'.txt',text)
-                st.success(f'{"既存" if existing else "作成"}: {doc_name}')
-                st.markdown(f'[Googleドキュメントを開く](https://docs.google.com/document/d/{doc["id"]}/edit)')
-        except Exception as exc:
-            st.error(f'Google Driveへの保存に失敗しました: {exc}。翻訳し直さずに再試行できます。')
+    st.subheader('④ Google Driveへ自動保存')
+    if complete:
+        docs=((Path(original_filename).stem,original),
+              (Path(translated_filename).stem,translated))
+        auto_save_documents(folder_url,docs,job_id)
+        if st.button('保存のみ再試行',key='pdf_autosave_retry'):
+            auto_save_documents(folder_url,docs,job_id,retry=True)
+    else:
+        st.caption('翻訳完了後、指定したフォルダに原文と日本語訳を自動アップロードします。')
 
 if __name__=='__main__':
     main()

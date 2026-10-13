@@ -33,7 +33,9 @@ def _google_login_url():
         raise RuntimeError("GOOGLE_REDIRECT_URIにはHTTPSのアプリURLを設定してください。")
     nonce=pysecrets.token_urlsafe(24)
     st.session_state["google_oauth_nonce"]=nonce
-    state=_google_signer().dumps({"nonce":nonce,"v":1})
+    from workflow_utils import oauth_preferences
+    state=_google_signer().dumps({"nonce":nonce,"v":1,"prefs":oauth_preferences(),
+                                  "page":st.session_state.get("ir_page", "")})
     return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode({
         "client_id":client_id, "redirect_uri":redirect_uri, "response_type":"code",
         "scope":DRIVE_SCOPE, "access_type":"offline", "prompt":"consent",
@@ -69,6 +71,11 @@ def _google_oauth_callback():
         token=result.json()
         if not token.get("access_token"):
             raise RuntimeError("Googleからアクセストークンが返されませんでした。")
+        from workflow_utils import restore_oauth_preferences
+        restore_oauth_preferences(payload.get("prefs", {}))
+        page = payload.get("page")
+        if page in ("📄 PDF → 全文翻訳 → Google Drive", "📑 Earnings + Follow-up 統合"):
+            st.session_state["ir_page"] = page
         st.session_state["google_drive_tokens"]={
             "access_token":token["access_token"],
             "refresh_token":token.get("refresh_token"),
