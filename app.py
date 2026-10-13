@@ -790,7 +790,7 @@ def display_cost_history():
     if not st.session_state.cost_history:
         return
     st.subheader("今回のセッションのAPI費用履歴")
-    st.dataframe(st.session_state.cost_history, use_container_width=True)
+    st.dataframe(st.session_state.cost_history, width="stretch")
     csv_buf = io.StringIO()
     writer = csv.DictWriter(csv_buf, fieldnames=list(st.session_state.cost_history[0].keys()))
     writer.writeheader()
@@ -799,7 +799,7 @@ def display_cost_history():
     st.caption("履歴は現在のStreamlitセッション内のみ保存。サーバー再起動やセッション終了で消える場合があります。")
 
 
-if st.button("文字起こし開始", type="primary", use_container_width=True):
+if st.button("文字起こし開始", type="primary", width="stretch"):
     if not url.strip():
         st.warning("URLを貼ってください。")
         st.stop()
@@ -961,7 +961,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
                     zip_bytes,
                     f"{base_name}_Original_and_Japanese_Translation.zip",
                     "application/zip",
-                    use_container_width=True,
+                    width="stretch",
                     type="primary",
                 )
             if save_drive_enabled:
@@ -1020,13 +1020,13 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
             display_cost_history()
             st.download_button(
                 "TXTをダウンロード", transcript_with_tags.encode("utf-8"),
-                f"{base_name}_transcript.txt", "text/plain", use_container_width=True,
+                f"{base_name}_transcript.txt", "text/plain", width="stretch",
             )
             if direct_caption_text is None and audio.exists():
                 with open(audio, "rb") as af:
                     audio_bytes = af.read()
                 st.download_button(
-                    "MP3もダウンロード", audio_bytes, f"{base_name}.mp3", "audio/mpeg", use_container_width=True,
+                    "MP3もダウンロード", audio_bytes, f"{base_name}.mp3", "audio/mpeg", width="stretch",
                 )
             elif direct_caption_text is not None:
                 st.caption("このURLは字幕ストリームのためMP3はありません。音声が必要な場合はaudio/video側のm3u8を貼ってください。")
