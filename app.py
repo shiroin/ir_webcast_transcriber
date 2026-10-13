@@ -16,11 +16,25 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
+# Startup diagnostics: no credentials, request URLs, or user content are logged.
+import logging
+_startup_log = logging.getLogger("ir_webcast_startup")
+if not _startup_log.handlers:
+    _handler = logging.StreamHandler(sys.stderr)
+    _handler.setFormatter(logging.Formatter("[IR STARTUP] %(levelname)s %(message)s"))
+    _startup_log.addHandler(_handler)
+_startup_log.setLevel(logging.INFO)
+_startup_log.propagate = False
+_startup_log.info("app.py imports completed; entering Streamlit page setup")
+
 st.set_page_config(page_title="IR Webcast Transcriber", page_icon="🎧", layout="centered")
+_startup_log.info("set_page_config completed")
 if "code" in st.query_params or "error" in st.query_params:
     from google_drive_integration import _google_oauth_callback
     _google_oauth_callback()
+_startup_log.info("OAuth callback check completed; rendering page selector")
 page = st.radio("機能を選択", ["📄 PDF → 全文翻訳 → Google Drive", "📑 Earnings + Follow-up 統合", "🎧 IR Webcast 文字起こし", "🌐 TXT・Google Docs 全文翻訳"], horizontal=True, key="ir_page")
+_startup_log.info("page selector rendered; selected section: %s", ["PDF", "Merge", "Transcription", "Translation"][["📄 PDF → 全文翻訳 → Google Drive", "📑 Earnings + Follow-up 統合", "🎧 IR Webcast 文字起こし", "🌐 TXT・Google Docs 全文翻訳"].index(page)])
 if page == "📄 PDF → 全文翻訳 → Google Drive":
     from pdf_pipeline import main as pdf_pipeline_main
     pdf_pipeline_main()
@@ -37,6 +51,7 @@ if page == "🌐 TXT・Google Docs 全文翻訳":
     runpy.run_path(str(Path(__file__).resolve().parent / "translation_page.py"), run_name="__main__")
     st.stop()
 
+_startup_log.info("entering transcription page")
 st.title("🎧 IR Webcast Transcriber")
 st.caption("音声取得はStreamlit、文字起こしは外部API。YouTube / Vimeo / SmartVision IR / Q4字幕M3U8 / MP3 / M3U8 / TS / IR webcastページ / IR Webcasting、英・中・韓・日に対応。")
 
