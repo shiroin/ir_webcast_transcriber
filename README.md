@@ -1,17 +1,23 @@
-# IR Webcast Transcriber v40 — YouTube JavaScript / HTTP 403 改善
+# IR Webcast Transcriber v41 — YouTube 403診断 + 音声ファイルアップロード
 
-## 修正
-- yt-dlp の Python パッケージを `yt-dlp[default]` に変更し、EJS チャレンジ解決コンポーネントを同時導入。
-- YouTube取得時に Deno 2.3+ / Node.js 22+ を検出。どちらもなければ公式Deno 2.5.6のLinux実行ファイルを一時ディレクトリに自動導入（GitHubへの接続が必要）。導入に失敗したら理由を表示。
-- `m.youtube.com/watch?v=...&pp=...` を通常の `www.youtube.com/watch?v=...` に正規化。
-- 音声フォーマット優先、タイムアウト・再試行・403診断。403の場合は無意味な連続リトライをしない。
-- PDF翻訳、Earnings/Follow-up統合翻訳、Google Docs自動保存など既存機能を維持。
+## 追加機能
 
-## 導入
-ZIPの全ファイルをGitHubリポジトリのルートに上書き/追加し、Streamlit CloudのRebootを実施。`youtube_runtime.py` の追加と `requirements.txt` の更新は必須。
+「🎧 IR Webcast 文字起こし」画面に次を追加。
+
+1. **YouTubeの音声形式を診断**：YouTube URLを入力し診断ボタンを押すと、yt-dlpバージョン、Deno/Node環境、動画メタデータの取得可否、音声形式のID・コーデック・プロトコルを表示。診断JSONをダウンロードできます。動画データはダウンロードしません。署名付きメディアURLやCookieは表示しません。
+2. **音声・動画ファイルをアップロード**：MP3 / M4A / WAV / MP4 / WEBM / MOV / AAC / FLAC / OGG。最大1GB。YouTube URLを入力していてもアップロードファイルを優先し、FFmpegで音声を変換して既存の文字起こし・全文翻訳・Google Drive自動保存へ進みます。URLを入力せずにファイルだけで処理できます。
+
+## 使い方
+
+1. ZIP内のファイルをGitHubリポジトリ直下に上書き・追加し、Streamlit Cloudで再デプロイ。
+2. YouTubeのURLを入力して「YouTubeの音声形式を診断」を押す。JSONを保存。
+3. 取得不可の場合は、権限のある音声・動画ファイルを自分のPCに用意し、アップロード欄から投入して「文字起こし開始」。
+4. 既存の翻訳とGoogle Drive自動保存を利用。
 
 ## 注意
-- 403はJavaScript実行環境の不足以外にも、YouTube側のネットワーク制限・地域制限・認証・動画固有の制限で発生します。自動導入後も403が出る場合はアプリ画面に表示された詳細を確認してください。
-- GitHub Releasesへのアクセスが制限される環境ではDeno自動導入に失敗します。その場合はDeno 2.3+ またはNode.js 22+ をデプロイ環境にインストールしてください。
-- Denoのダウンロード先は公式GitHub Releasesの特定バージョンです。実行ファイルのチェックサム検証は行っていません。運用環境では固定ハッシュの検証やビルド時の導入を推奨します。
-- Python構文チェック済み。Streamlit Cloud / YouTubeへの実接続は未検証です。
+
+- 403を解消するものではありません。YouTube側のアクセス制限が残る場合は直接アップロード経路をご利用ください。
+- 診断で音声形式が見えても、動画データの取得は403になることがあります。
+- アップロード容量は1GBに制限。Streamlit Cloudの利用可能メモリ・ディスク・アップロード設定によっては、さらに小さいサイズに制限される場合があります。
+- 動画の取得・利用について権利と利用条件を守ってください。
+- Python構文チェック済み。YouTube/Google Driveへの実接続および本番環境での実動作は未検証。

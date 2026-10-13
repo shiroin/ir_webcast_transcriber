@@ -451,6 +451,84 @@ def yt_dlp_audio_get(url, out_path):
                        +'JS環境だけでは解除できません。')
 
 
+
+def youtube_diagnostic(url):
+    """Metadata-only yt-dlp probe: never downloads media or exposes signed URLs."""
+    from youtube_runtime import youtube_js_args
+    from urllib.parse import parse_qs
+    parsed = urlparse(url)
+    vid = parsed.path.strip('/').split('/')[0] if 'youtu.be' in parsed.netloc else parse_qs(parsed.query).get('v', [''])[0]
+    if not re.fullmatch(r'[A-Za-z0-9_-]{11}', vid):
+        raise ValueError('YouTube動画IDが見つかりません')
+    target='https://www.youtube.com/watch?v='+vid
+    js_args, js_description = youtube_js_args()
+    version=subprocess.run([sys.executable,'-m','yt_dlp','--version'],capture_output=True,text=True,timeout=15).stdout.strip()
+    cmd=[sys.executable,'-m','yt_dlp','--no-config','--no-playlist',
+         '--skip-download','--no-warnings','--socket-timeout','20',
+         '--retries','0','--fragment-retries','0',*js_args,
+         '-J',target]
+    try:
+        result=subprocess.run(cmd,capture_output=True,text=True,timeout=100)
+    except subprocess.TimeoutExpired:
+        return {'yt_dlp':version,'js':js_description,'metadata_ok':False,
+                'error':'動画情報取得が100秒でタイムアウトしました','formats':[]}
+    # Do not surface complete stderr or URLs: can contain signed parameters.
+    if result.returncode:
+        err=(result.stderr or '')
+        message=('HTTP 403 Forbidden' if '403' in err else
+                 'ログインまたはbot確認が必要' if 'Sign in' in err or 'bot' in err.lower() else
+                 '動画情報の取得に失敗')
+        return {'yt_dlp':version,'js':js_description,'metadata_ok':False,
+                'error':message,'formats':[]}
+    try:
+        import json
+        info=json.loads(result.stdout)
+        formats=[]
+        for fmt in info.get('formats',[]):
+            if fmt.get('acodec') in (None,'none'):
+                continue
+            formats.append({'format_id':str(fmt.get('format_id','')),
+                            'ext':fmt.get('ext',''),
+                            'audio_codec':fmt.get('acodec',''),
+                            'protocol':fmt.get('protocol',''),
+                            'bitrate_kbps':fmt.get('abr')})
+        return {'yt_dlp':version,'js':js_description,'metadata_ok':True,
+                'video_id':vid,'audio_format_count':len(formats),
+                'formats':formats[:40]}
+    except Exception:
+        return {'yt_dlp':version,'js':js_description,'metadata_ok':False,
+                'error':'動画情報の解析に失敗','formats':[]}
+
+
+def transcode_uploaded_audio(upload, out_path):
+    """Bounded, on-disk upload conversion; avoids the YouTube/yt-dlp network path."""
+    suffix=Path(upload.name).suffix.lower()
+    if suffix not in {'.mp3','.m4a','.wav','.mp4','.webm','.mov','.aac','.flac','.ogg'}:
+        raise ValueError('未対応のファイル形式です')
+    # A disk-backed temporary file keeps the peak Python heap small.
+    source=out_path.parent/('uploaded_source'+suffix)
+    max_size=1024*1024*1024
+    try:
+        with source.open('wb') as f:
+            total=0
+            upload.seek(0)
+            while True:
+                chunk=upload.read(1024*1024)
+                if not chunk:break
+                total+=len(chunk)
+                if total>max_size:
+                    raise ValueError('アップロードファイルが1GBを超えています')
+                f.write(chunk)
+        cmd=['ffmpeg','-nostdin','-y','-hide_banner','-loglevel','error',
+             '-i',str(source),'-map','0:a:0','-vn','-ac','1','-ar','16000',
+             '-c:a','libmp3lame','-b:a','32k',str(out_path)]
+        result=subprocess.run(cmd,capture_output=True,text=True,timeout=1800)
+        if result.returncode or not out_path.exists() or out_path.stat().st_size==0:
+            raise RuntimeError('アップロード音声の変換に失敗: '+result.stderr[-500:])
+        return out_path
+    finally:
+        source.unlink(missing_ok=True)
+
 def vimeo_audio_get(url, out_path):
     """Vimeo専用。
 
@@ -1085,14 +1163,43 @@ def display_cost_history():
     st.caption("履歴は現在のStreamlitセッション内のみ保存。サーバー再起動やセッション終了で消える場合があります。")
 
 
+st.subheader("YouTube取得診断・ローカルファイル代替")
+st.caption("403の切り分け用。動画情報のみ確認し、音声データは取得しません。署名付きURLやCookieは表示しません。")
+if is_youtube(url) and st.button("YouTubeの音声形式を診断",key="youtube_diagnose"):
+    try:
+        report=youtube_diagnostic(url)
+        st.session_state['youtube_last_diagnostic']=report
+    except Exception as exc:
+        st.error(f"診断できませんでした: {type(exc).__name__}")
+if is_youtube(url) and st.session_state.get('youtube_last_diagnostic'):
+    report=st.session_state['youtube_last_diagnostic']
+    st.write('yt-dlp:',report.get('yt_dlp'),' / JS:',report.get('js'))
+    if report.get('metadata_ok'):
+        st.success(f"動画情報取得OK。音声形式 {report.get('audio_format_count',0)}件")
+        st.dataframe(report.get('formats',[]),use_container_width=True)
+        st.info('動画情報の取得に成功しても、メディア本体の403は別途発生することがあります。')
+    else:
+        st.warning(report.get('error','取得できませんでした'))
+    import json
+    st.download_button('診断結果JSONを保存',json.dumps(report,ensure_ascii=False,indent=2).encode('utf-8'),
+                       file_name='youtube_diagnostic.json',mime='application/json')
+
+uploaded_media=st.file_uploader(
+    "音声・動画ファイルをアップロード（YouTubeの403を回避する代替入力）",
+    type=['mp3','m4a','wav','mp4','webm','mov','aac','flac','ogg'],
+    key='transcription_media_upload',
+    help='ご自身が利用権限を持つファイルをアップロードしてください。最大1GB。')
+if uploaded_media is not None:
+    st.info('アップロードしたファイルを優先して文字起こしします。YouTubeへのアクセスは行いません。')
+
 if st.button("文字起こし開始", type="primary", use_container_width=True):
-    if not url.strip():
-        st.warning("URLを貼ってください。")
+    if not url.strip() and uploaded_media is None:
+        st.warning("URLを貼るか、音声・動画ファイルをアップロードしてください。")
         st.stop()
     if not api_key:
         st.error("OpenAI API Key が必要です。画面に入力するか、Streamlit Secrets に OPENAI_API_KEY を設定してください。")
         st.stop()
-    if (is_youtube(url) or is_vimeo(url)) and not yt_dlp_available():
+    if uploaded_media is None and (is_youtube(url) or is_vimeo(url)) and not yt_dlp_available():
         st.error("yt-dlp が見つかりません。requirements.txt を確認してください。")
         st.stop()
 
@@ -1108,7 +1215,11 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
             direct_caption_text = None
             source_kind = kind(url)
 
-            if is_gridow_page(url):
+            if uploaded_media is not None:
+                status.info('アップロードされた音声・動画から音声抽出中…')
+                audio=transcode_uploaded_audio(uploaded_media,audio)
+                source='Uploaded media: '+Path(uploaded_media.name).name
+            elif is_gridow_page(url):
                 status.info("Gridowの埋め込みプレイヤーを解析中…（yt-dlp → iframe → HLS/MP4）")
                 audio = gridow_audio_get(url, audio)
                 source = "Gridow webcast"
