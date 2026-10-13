@@ -25,10 +25,33 @@ if not _startup_log.handlers:
     _startup_log.addHandler(_handler)
 _startup_log.setLevel(logging.INFO)
 _startup_log.propagate = False
+
+# Linux /proc memory diagnostics; stdlib only, no user data.
+def _memory_checkpoint(stage):
+    try:
+        fields = {}
+        with open("/proc/self/status", encoding="utf-8") as proc:
+            for line in proc:
+                if line.startswith(("VmRSS:", "VmHWM:", "VmSize:")):
+                    key, value = line.split(":", 1)
+                    fields[key] = int(value.strip().split()[0]) / 1024
+        with open("/sys/fs/cgroup/memory.current", encoding="utf-8") as proc:
+            cgroup_mb = int(proc.read().strip()) / 1048576
+        _startup_log.info(
+            "MEMORY %s: process_rss=%.1f MB, process_peak_rss=%.1f MB, "
+            "process_virtual=%.1f MB, cgroup_used=%.1f MB",
+            stage, fields.get("VmRSS", -1), fields.get("VmHWM", -1),
+            fields.get("VmSize", -1), cgroup_mb,
+        )
+    except Exception as exc:
+        _startup_log.info("MEMORY %s: metrics unavailable (%s)", stage, type(exc).__name__)
+
+_memory_checkpoint("imports")
 _startup_log.info("app.py imports completed; entering Streamlit page setup")
 
 st.set_page_config(page_title="IR Webcast Transcriber", page_icon="🎧", layout="centered")
 _startup_log.info("set_page_config completed")
+_memory_checkpoint("page_config")
 if "code" in st.query_params or "error" in st.query_params:
     from google_drive_integration import _google_oauth_callback
     _google_oauth_callback()
@@ -39,12 +62,14 @@ if page == "📄 PDF → 全文翻訳 → Google Drive":
     _startup_log.info("PDF: before importing pdf_pipeline")
     from pdf_pipeline import main as pdf_pipeline_main
     _startup_log.info("PDF: import completed; before main()")
+    _memory_checkpoint("pdf_import")
     try:
         pdf_pipeline_main()
     except Exception:
         _startup_log.exception("PDF: main() raised an exception")
         raise
     _startup_log.info("PDF: main() completed")
+    _memory_checkpoint("pdf_main")
     st.stop()
 if page == "📑 Earnings + Follow-up 統合":
     from merge_calls import main as merge_calls_main
