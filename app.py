@@ -211,12 +211,73 @@ def ffmpeg_available():
 
 
 def ffmpeg_get(url, out_path):
-    run([
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-user_agent", UA, "-i", url,
-        "-vn", "-c:a", "libmp3lame", "-b:a", "64k", str(out_path),
-    ])
-    return out_path
+    """Stream audio from remote media; never load a large MP4 into Python RAM.
+
+    Some corporate CDNs reject ffmpeg's direct requests. Fall back to a bounded,
+    streamed download to disk, then transcode the local file.
+    """
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in ("https", "http"):
+        raise ValueError("http(s)形式のメディアURLを指定してください。")
+    ffmpeg_base = [
+        "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
+    ]
+    encode_args = [
+        "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+        "-c:a", "libmp3lame", "-b:a", "32k", str(out_path),
+    ]
+    direct = ffmpeg_base + [
+        "-rw_timeout", "30000000", "-user_agent", UA,
+        "-headers", f"Referer: {parsed.scheme}://{parsed.netloc}/\\r\\n",
+        "-i", url,
+    ] + encode_args
+    try:
+        subprocess.run(direct, check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, timeout=1800)
+        if out_path.exists() and out_path.stat().st_size > 0:
+            return out_path
+        raise RuntimeError("変換後の音声が空です")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as exc:
+        direct_error = str(exc)[-600:]
+        out_path.unlink(missing_ok=True)
+
+    # Fallback: stream to disk in small blocks, not requests.get(...).content.
+    # Keep bounded to protect Streamlit Cloud's ephemeral disk.
+    local_video = out_path.with_suffix(".source.mp4")
+    limit = 1_000_000_000  # 1 GB max temporary download
+    try:
+        with requests.get(
+            url, stream=True, timeout=(20, 90),
+            headers={"User-Agent": UA, "Referer": f"{parsed.scheme}://{parsed.netloc}/",
+                     "Accept": "*/*"},
+        ) as response:
+            response.raise_for_status()
+            size_header = int(response.headers.get("Content-Length") or 0)
+            if size_header > limit:
+                raise RuntimeError("動画が1GBを超えます。Streamlit Cloudの容量制限を避けるため中断しました。")
+            received = 0
+            with local_video.open("wb") as f:
+                for block in response.iter_content(chunk_size=1024 * 1024):
+                    if not block:
+                        continue
+                    received += len(block)
+                    if received > limit:
+                        raise RuntimeError("動画が1GBを超えたため中断しました。")
+                    f.write(block)
+        subprocess.run(ffmpeg_base + ["-i", str(local_video)] + encode_args,
+                       check=True, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.PIPE, timeout=1800)
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            raise RuntimeError("音声の抽出結果が空です")
+        return out_path
+    except Exception as exc:
+        raise RuntimeError(
+            "MP4の音声抽出に失敗しました。"
+            f"直接変換: {direct_error}; ストリーミング取得: {str(exc)[-600:]}"
+        ) from exc
+    finally:
+        local_video.unlink(missing_ok=True)
 
 
 def yt_dlp_audio_get(url, out_path):
