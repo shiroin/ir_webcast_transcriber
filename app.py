@@ -74,63 +74,121 @@ def is_q4_recording_link(url):
             and re.search(r"/videos/[^/]+/videoRecordingLink[^/]*$", parsed.path, re.I) is not None)
 
 
-def q4_recording_audio_get(url, out_path):
-    """Resolve extensionless Q4 recording links without treating media as HTML.
-
-    Q4 may redirect to MP4, HLS, audio, or return media with a Content-Type.
-    Prefer ffmpeg for streams; use yt-dlp as a fallback for provider pages.
-    """
-    headers = {"User-Agent": UA, "Accept": "*/*"}
-    resolved_url = url
-    content_type = ""
+def _bounded_command(cmd, timeout=1200):
+    """Never keep an unbounded video decoder or stdout buffer alive."""
     try:
-        with requests.get(url, headers=headers, allow_redirects=True,
-                          stream=True, timeout=(15, 30)) as response:
-            response.raise_for_status()
-            resolved_url = response.url
-            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower().strip()
-            # Close without consuming the whole video: ffmpeg streams the source.
+        return subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.PIPE, timeout=timeout, check=True)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"動画処理が{timeout}秒でタイムアウトしました") from exc
+    except subprocess.CalledProcessError as exc:
+        err=(exc.stderr or b"").decode("utf-8", errors="replace")
+        raise RuntimeError(f"メディア処理エラー: {err[-1200:]}") from exc
+
+
+def _q4_transcode_stream(url, out_path, referer=None, timeout=1200):
+    """Decode only the audio stream; no MP4 download and no in-memory video."""
+    from urllib.parse import urlsplit
+    parsed=urlsplit(url)
+    if parsed.scheme not in ("https", "http"):
+        raise ValueError("メディアURLはHTTP(S)である必要があります")
+    # Use a finite duration and retry budget, so broken CDN connections do not hang.
+    referer=referer or f"{parsed.scheme}://{parsed.netloc}/"
+    cmd=["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+         "-rw_timeout", "30000000", "-user_agent", UA,
+         "-headers", f"Referer: {referer}\r\n",
+         "-reconnect", "1", "-reconnect_streamed", "1",
+         "-reconnect_delay_max", "5", "-i", url,
+         "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+         "-c:a", "libmp3lame", "-b:a", "32k", str(out_path)]
+    try:
+        _bounded_command(cmd,timeout=timeout)
+        if not out_path.is_file() or out_path.stat().st_size < 1000:
+            raise RuntimeError("抽出した音声が空です")
+        return out_path
+    except Exception:
+        out_path.unlink(missing_ok=True)
+        raise
+
+
+def _q4_yt_dlp_media_urls(url):
+    """Extract media URLs without downloading the full video."""
+    cmd=[sys.executable,"-m","yt_dlp","--no-playlist","--no-warnings",
+         "--skip-download","-f","bestaudio/best","--get-url",url]
+    result=subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True,
+                          text=True, timeout=90)
+    if result.returncode:
+        raise RuntimeError((result.stderr or "yt-dlpで解析できません")[-600:])
+    return [line.strip() for line in result.stdout.splitlines()
+            if line.strip().startswith(("https://","http://"))]
+
+
+def q4_recording_audio_get(url, out_path):
+    """Q4 extensionless links: avoid full video download, with bounded fallbacks."""
+    errors=[]
+    resolved=url
+    content_type=""
+    # HEAD does not download the video; some CDNs reject HEAD, so it is optional.
+    try:
+        with requests.head(url, headers={"User-Agent":UA,"Accept":"*/*"},
+                           allow_redirects=True, timeout=(8,15)) as response:
+            if response.ok:
+                resolved=response.url
+                content_type=response.headers.get("Content-Type","").lower()
     except requests.RequestException as exc:
-        raise RuntimeError(f"Q4録画リンクの取得に失敗しました: {exc}") from exc
+        errors.append(f"HEAD: {str(exc)[-200:]}")
 
-    if is_caption_m3u8(resolved_url):
-        raise RuntimeError("字幕のみのM3U8です。字幕取得ルートをご利用ください。")
-
-    # HTML player / JSON descriptor needs media discovery or yt-dlp, not ffmpeg.
-    is_page = content_type in ("text/html", "application/xhtml+xml", "application/json")
-    errors = []
-    if not is_page:
-        try:
-            ffmpeg_get(resolved_url, out_path)
-            if out_path.is_file() and out_path.stat().st_size > 0:
-                return out_path
-            raise RuntimeError("音声ファイルが空です")
-        except Exception as exc:
-            errors.append(f"ffmpeg: {str(exc)[-650:]}")
-            out_path.unlink(missing_ok=True)
-    if is_page:
-        try:
-            candidates, _ = discover_nested_player_media(resolved_url, max_depth=2)
-            if not candidates:
-                candidates = discover_media(resolved_url)
-            for media in candidates[:8]:
-                try:
-                    ffmpeg_get(media, out_path)
-                    if out_path.is_file() and out_path.stat().st_size > 0:
-                        return out_path
-                except Exception as exc:
-                    errors.append(f"player media: {str(exc)[-250:]}")
-                    out_path.unlink(missing_ok=True)
-        except Exception as exc:
-            errors.append(f"player discovery: {str(exc)[-450:]}")
+    candidates=[]
+    if "text/html" not in content_type and "application/json" not in content_type:
+        candidates.append(resolved)
     if yt_dlp_available():
-        for candidate in dict.fromkeys((resolved_url, url)):
-            try:
-                return yt_dlp_audio_get(candidate, out_path)
-            except Exception as exc:
-                errors.append(f"yt-dlp: {str(exc)[-650:]}")
-    raise RuntimeError("Q4録画リンクから音声を取得できませんでした。"
-                       "アクセス制限・配信期限・DRMの可能性があります。\n" + "\n".join(errors[-4:]))
+        try:
+            candidates.extend(_q4_yt_dlp_media_urls(url))
+        except Exception as exc:
+            errors.append(f"yt-dlp URL解析: {str(exc)[-400:]}")
+    # A Q4 URL can resolve to an HTML player, not an actual media file.
+    try:
+        if not candidates or "text/html" in content_type or "application/json" in content_type:
+            nested,_=discover_nested_player_media(resolved,max_depth=2)
+            candidates.extend(nested[:10])
+    except Exception as exc:
+        errors.append(f"プレイヤー解析: {str(exc)[-400:]}")
+    if resolved not in candidates:
+        candidates.append(resolved)
+    if url not in candidates:
+        candidates.append(url)
+    for candidate in dict.fromkeys(candidates):
+        try:
+            return _q4_transcode_stream(candidate,out_path,referer=url)
+        except Exception as exc:
+            errors.append(f"音声ストリーム: {str(exc)[-450:]}")
+    # yt-dlp's audio-only downloader can handle segmented streams that FFmpeg cannot.
+    # Unlike the old implementation, never fetch a 1GB+ source MP4 as fallback.
+    if yt_dlp_available():
+        try:
+            temp_dir=out_path.parent / "q4_audio_only"
+            temp_dir.mkdir(exist_ok=True)
+            template=str(temp_dir / "audio.%(ext)s")
+            _bounded_command([sys.executable,"-m","yt_dlp","--no-playlist",
+                              "--no-progress","--retries","3","--fragment-retries","5",
+                              "--socket-timeout","30","-f","bestaudio/best",
+                              "--max-filesize","700M","-o",template,url],timeout=1200)
+            sources=[x for x in temp_dir.iterdir() if x.is_file()
+                     and not x.name.endswith((".part",".ytdl"))]
+            if sources:
+                _bounded_command(["ffmpeg","-nostdin","-y","-hide_banner",
+                                  "-loglevel","error","-i",str(sources[0]),
+                                  "-map","0:a:0","-vn","-ac","1","-ar","16000",
+                                  "-c:a","libmp3lame","-b:a","32k",str(out_path)],timeout=1200)
+                if out_path.exists() and out_path.stat().st_size>1000:
+                    return out_path
+        except Exception as exc:
+            errors.append(f"音声のみ取得: {str(exc)[-500:]}")
+        finally:
+            shutil.rmtree(out_path.parent / "q4_audio_only",ignore_errors=True)
+    raise RuntimeError("Q4録画リンクから音声を取得できませんでした。\n"
+                       "動画全体をメモリに読み込まずに複数方式を試しました。\n"
+                       + "\n".join(errors[-6:]))
 
 
 def is_caption_m3u8(url):
@@ -1155,11 +1213,12 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
                 f"{base_name}_transcript.txt", "text/plain", use_container_width=True,
             )
             if direct_caption_text is None and audio.exists():
-                with open(audio, "rb") as af:
-                    audio_bytes = af.read()
-                st.download_button(
-                    "MP3もダウンロード", audio_bytes, f"{base_name}.mp3", "audio/mpeg", use_container_width=True,
-                )
+                if audio.stat().st_size <= 25 * 1024 * 1024:
+                    with open(audio, "rb") as af:
+                        st.download_button("MP3もダウンロード", af.read(),
+                                           f"{base_name}.mp3", "audio/mpeg", use_container_width=True)
+                else:
+                    st.caption("MP3が25MBを超えるため、Streamlitのメモリ保護のためダウンロード表示を省略しました。")
             elif direct_caption_text is not None:
                 st.caption("このURLは字幕ストリームのためMP3はありません。音声が必要な場合はaudio/video側のm3u8を貼ってください。")
     except Exception as e:

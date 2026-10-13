@@ -1,13 +1,20 @@
-# IR Webcast Transcriber v37 — Advantest MP4安定化
+# IR Webcast Transcriber v38 — Q4録画リンクの安定化
 
-## 修正
-- `https://www2.advantest.com/IR/video/FY2026/1Q/ja/O_QandA_260729.mp4` のような直接MP4 URLの音声取得を強化。
-- FFmpegによる直接ストリーミング変換を試し、失敗した場合はHTTPで1MBずつ一時ファイルにダウンロードしてから変換。動画をPythonメモリに丸ごと保持しない。
-- 通信タイムアウト・FFmpegの処理時間上限・一時ファイル削除・1GB上限を追加。
-- 既存の翻訳・Google Drive自動保存などの機能を維持。
+## 改善
+- 拡張子のないQ4録画URLについて、HEADでリダイレクト先を確認（HEAD拒否時も続行）。
+- yt-dlpでメディアURLを解析し、可能な限り音声ストリームのみFFmpegで直接圧縮。
+- HTMLプレイヤーに解決された場合は埋め込みメディアを探索。
+- FFmpegで取得できない場合、yt-dlpで音声のみを取得してローカル変換。
+- 外部プロセスに時間制限を設け、動画全体をメモリに保持しない。
+- 音声のみの一時取得は700MB上限を設定。中間ファイルを削除。
+- 大容量MP3のダウンロードボタン生成による追加メモリ消費を抑制。
+- 従来のPDF・Earnings/Follow-up統合翻訳・Google Docs保存機能は維持。
 
-## 導入
-ZIPの全ファイルを既存GitHubリポジトリ直下にアップロードしてStreamlit Cloudを再起動。文字起こし画面にMP4 URLをそのまま貼り付けて実行。
+## 更新
+ZIP内の全ファイルを既存GitHubリポジトリのルートに上書きして、Streamlit Cloudを再デプロイしてください。既存のSecrets設定は維持できます。
 
-## 検証
-Python構文検証済み。実際のAdvantest配信URLは実行環境から接続できなかったため、本番での動作は未検証。エラーが続く場合はStreamlit Cloudログの最後の例外と動画の容量・長さを確認してください。動画が1GB超の場合は別の取得方法が必要です。
+## 制限・検証
+- Python構文チェック済み。Q4実URLへの通信・OpenAI文字起こし・Google Drive保存の実地試験は未実施。
+- 配信元が署名URL期限切れ、アクセス制限、DRMを使用する場合は取得できないことがあります。
+- Streamlit Cloudのメモリ・ディスク・実行時間制限が厳しい場合は長時間の動画処理が失敗することがあります。
+- 問題が続く場合はStreamlit Cloudのログ（Traceback末尾）を確認してください。
