@@ -37,11 +37,20 @@ def _memory_checkpoint(stage):
                     fields[key] = int(value.strip().split()[0]) / 1024
         with open("/sys/fs/cgroup/memory.current", encoding="utf-8") as proc:
             cgroup_mb = int(proc.read().strip()) / 1048576
+        def _read_cgroup(name):
+            try:
+                with open("/sys/fs/cgroup/" + name, encoding="utf-8") as file:
+                    return file.read().strip()
+            except OSError:
+                return "unavailable"
+        limit = _read_cgroup("memory.max")
+        limit_mb = round(int(limit) / 1048576, 1) if limit.isdigit() else limit
+        events = _read_cgroup("memory.events").replace("\\n", " ").replace("\n", ", ")
         _startup_log.info(
             "MEMORY %s: process_rss=%.1f MB, process_peak_rss=%.1f MB, "
-            "process_virtual=%.1f MB, cgroup_used=%.1f MB",
+            "process_virtual=%.1f MB, cgroup_used=%.1f MB, cgroup_limit=%s MB, events=%s",
             stage, fields.get("VmRSS", -1), fields.get("VmHWM", -1),
-            fields.get("VmSize", -1), cgroup_mb,
+            fields.get("VmSize", -1), cgroup_mb, limit_mb, events,
         )
     except Exception as exc:
         _startup_log.info("MEMORY %s: metrics unavailable (%s)", stage, type(exc).__name__)
