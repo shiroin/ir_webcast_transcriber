@@ -1,20 +1,10 @@
-# IR Webcast Transcriber v38 — Q4録画リンクの安定化
+# IR Webcast Transcriber v39 — Gridow配信ページ対応
 
-## 改善
-- 拡張子のないQ4録画URLについて、HEADでリダイレクト先を確認（HEAD拒否時も続行）。
-- yt-dlpでメディアURLを解析し、可能な限り音声ストリームのみFFmpegで直接圧縮。
-- HTMLプレイヤーに解決された場合は埋め込みメディアを探索。
-- FFmpegで取得できない場合、yt-dlpで音声のみを取得してローカル変換。
-- 外部プロセスに時間制限を設け、動画全体をメモリに保持しない。
-- 音声のみの一時取得は700MB上限を設定。中間ファイルを削除。
-- 大容量MP3のダウンロードボタン生成による追加メモリ消費を抑制。
-- 従来のPDF・Earnings/Follow-up統合翻訳・Google Docs保存機能は維持。
+## 新機能
+`https://wms.gridow.com/ir/nanya/nanya_2026Q3.html` のようなGridow IR配信ページを認識し、yt-dlpでページを解析、失敗した場合はiframe/埋め込みプレイヤーの探索とFFmpegによる音声取得を順に試みます。取得した音声は従来の文字起こし→日本語翻訳→Google Drive自動保存に引き渡します。
 
-## 更新
-ZIP内の全ファイルを既存GitHubリポジトリのルートに上書きして、Streamlit Cloudを再デプロイしてください。既存のSecrets設定は維持できます。
+## 導入
+ZIP内の全ファイルを既存のGitHubリポジトリ直下に上書きして、Streamlit Cloudを再起動してください。「🎧 IR Webcast 文字起こし」でGridowのページURLを入力します。
 
-## 制限・検証
-- Python構文チェック済み。Q4実URLへの通信・OpenAI文字起こし・Google Drive保存の実地試験は未実施。
-- 配信元が署名URL期限切れ、アクセス制限、DRMを使用する場合は取得できないことがあります。
-- Streamlit Cloudのメモリ・ディスク・実行時間制限が厳しい場合は長時間の動画処理が失敗することがあります。
-- 問題が続く場合はStreamlit Cloudのログ（Traceback末尾）を確認してください。
+## 注意
+配信サイトへの実接続はネットワーク制限により未検証です。認証・地域制限・DRM・ブラウザ専用JS処理が必要な場合は自動取得できません。その場合はStreamlitのエラー詳細またはブラウザ開発者ツールで確認したメディアURLを共有してください。Python構文とZIPの整合性は確認済みです。

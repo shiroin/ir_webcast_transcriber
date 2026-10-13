@@ -38,7 +38,7 @@ if page == "🌐 TXT・Google Docs 全文翻訳":
     st.stop()
 
 st.title("🎧 IR Webcast Transcriber")
-st.caption("音声取得はStreamlit、文字起こしは外部API。YouTube / Vimeo / SmartVision IR / Q4録画リンク / Q4字幕M3U8 / MP3 / M3U8 / TS / IR webcastページ / IR Webcasting、英・中・韓・日に対応。")
+st.caption("音声取得はStreamlit、文字起こしは外部API。YouTube / Vimeo / SmartVision IR / Gridow / Q4録画リンク / Q4字幕M3U8 / MP3 / M3U8 / TS / IR webcastページ / IR Webcasting、英・中・韓・日に対応。")
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36"
 OPENAI_TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions"
@@ -189,6 +189,76 @@ def q4_recording_audio_get(url, out_path):
     raise RuntimeError("Q4録画リンクから音声を取得できませんでした。\n"
                        "動画全体をメモリに読み込まずに複数方式を試しました。\n"
                        + "\n".join(errors[-6:]))
+
+
+def is_gridow_page(url):
+    host = (urlparse(url).hostname or "").lower()
+    return host == "wms.gridow.com" or host.endswith(".gridow.com")
+
+
+def gridow_audio_get(page_url, out_path):
+    """Resolve embedded Gridow webcast media with bounded fallbacks.
+
+    Never download entire videos into Python memory. All media is converted to
+    compact MP3, preserving the existing transcription pipeline.
+    """
+    errors = []
+    if yt_dlp_available():
+        # yt-dlp can recognize dynamically configured iframe players that do
+        # not expose an .m3u8 literal in the parent page HTML.
+        try:
+            template = str(out_path.with_suffix(".%(ext)s"))
+            cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist",
+                   "--no-warnings", "--socket-timeout", "25", "--retries", "2",
+                   "--fragment-retries", "2", "--referer", page_url,
+                   "--user-agent", UA, "-x", "--audio-format", "mp3",
+                   "--audio-quality", "5", "-o", template, page_url]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                           text=True, timeout=900, check=True)
+            if out_path.exists() and out_path.stat().st_size:
+                return out_path
+            errors.append("yt-dlpは音声ファイルを生成しませんでした")
+        except subprocess.TimeoutExpired:
+            errors.append("yt-dlp: 15分の制限時間を超過")
+        except subprocess.CalledProcessError as exc:
+            errors.append("yt-dlp: " + (exc.stderr or "unknown")[-500:])
+        except Exception as exc:
+            errors.append("yt-dlp: " + str(exc)[-400:])
+        out_path.unlink(missing_ok=True)
+
+    try:
+        candidates, player_pages = discover_nested_player_media(page_url, max_depth=3)
+        if not candidates:
+            candidates = discover_media(page_url)
+        for player in player_pages[:6]:
+            if yt_dlp_available():
+                try:
+                    template = str(out_path.with_suffix(".%(ext)s"))
+                    cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist",
+                           "--socket-timeout", "20", "--retries", "1",
+                           "--referer", page_url, "-x", "--audio-format", "mp3",
+                           "-o", template, player]
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                   text=True, timeout=480, check=True)
+                    if out_path.exists() and out_path.stat().st_size:
+                        return out_path
+                except Exception as exc:
+                    errors.append("iframe yt-dlp: " + str(exc)[-250:])
+                out_path.unlink(missing_ok=True)
+        for candidate in candidates[:12]:
+            try:
+                return ffmpeg_get(candidate, out_path)
+            except Exception as exc:
+                errors.append("media: " + str(exc)[-350:])
+                out_path.unlink(missing_ok=True)
+    except Exception as exc:
+        errors.append("HTML/iframe探索: " + str(exc)[-450:])
+    raise RuntimeError(
+        "Gridowの配信音声を自動取得できませんでした。"
+        "ページがJavaScript実行・ログイン・地域制限・DRMを必要とする可能性があります。"
+        "ブラウザの開発者ツール > Network > Mediaで実際のm3u8/mp4/mp3を確認してください。\n"
+        + "\n".join(errors[-5:])
+    )
 
 
 def is_caption_m3u8(url):
@@ -1008,7 +1078,11 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
             direct_caption_text = None
             source_kind = kind(url)
 
-            if is_q4_recording_link(url):
+            if is_gridow_page(url):
+                status.info("Gridowの埋め込みプレイヤーを解析中…（yt-dlp → iframe → HLS/MP4）")
+                audio = gridow_audio_get(url, audio)
+                source = "Gridow webcast"
+            elif is_q4_recording_link(url):
                 status.info("Q4録画リンクを解析中…（リダイレクト・動画形式を自動判定）")
                 audio = q4_recording_audio_get(url, audio)
                 source = "Q4 recording link"
