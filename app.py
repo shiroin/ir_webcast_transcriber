@@ -345,8 +345,9 @@ def caption_m3u8_to_text(url):
     return "\n".join(cues)
 
 def is_youtube(url):
-    host = urlparse(url).netloc.lower()
-    return "youtube.com" in host or "youtu.be" in host
+    value = (url or "").strip()
+    host = urlparse(value if "://" in value else "https://" + value).netloc.lower()
+    return "youtube.com" in host or "youtu.be" in host or "youtube-nocookie.com" in host
 
 
 def is_vimeo(url):
@@ -433,20 +434,38 @@ def ffmpeg_get(url, out_path):
         local_video.unlink(missing_ok=True)
 
 
+def youtube_video_id(url):
+    """11-char video ID from watch / live / shorts / embed / youtu.be URLs (with or without https://)."""
+    from urllib.parse import parse_qs, unquote
+    value = (url or "").strip()
+    if value and not value.startswith(("http://", "https://")):
+        value = "https://" + value
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    parts = [x for x in parsed.path.split("/") if x]
+    candidates = []
+    if host.endswith("youtu.be") and parts:
+        candidates.append(parts[0])
+    candidates += parse_qs(parsed.query).get("v", [])
+    if len(parts) >= 2 and parts[0] in ("live", "shorts", "embed", "v", "e"):
+        candidates.append(parts[1])
+    # attribution_link?u=/watch%3Fv%3D... and other wrapped forms.
+    match = re.search(r"(?:v=|/)([A-Za-z0-9_-]{11})(?=$|[?&#/])", unquote(value))
+    if match:
+        candidates.append(match.group(1))
+    for candidate in candidates:
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", candidate):
+            return candidate
+    raise ValueError(f"YouTubeの動画IDをURLから取得できませんでした: {url}")
+
+
 def yt_dlp_audio_get(url, out_path):
     """YouTube: use supported JS runtime, EJS, bounded retries and diagnostics."""
     from youtube_runtime import youtube_js_args
     js_args, js_description = youtube_js_args()
     template = str(out_path.with_suffix('.%(ext)s'))
-    # Normalize mobile YouTube URLs, remove tracking parameters.
-    from urllib.parse import parse_qs
-    parsed = urlparse(url)
-    if 'youtu.be' in parsed.netloc.lower():
-        video_id = parsed.path.strip('/').split('/')[0]
-    else:
-        video_id = parse_qs(parsed.query).get('v', [''])[0]
-    if not re.fullmatch(r'[A-Za-z0-9_-]{11}', video_id):
-        raise RuntimeError('YouTubeの動画IDをURLから取得できませんでした。')
+    # Normalize live / shorts / mobile URLs and remove tracking parameters.
+    video_id = youtube_video_id(url)
     normalized_url = 'https://www.youtube.com/watch?v=' + video_id
     errors = []
     # Do not use format IDs or bypasses that depend on undocumented clients.
@@ -481,11 +500,7 @@ def yt_dlp_audio_get(url, out_path):
 def youtube_diagnostic(url):
     """Metadata-only yt-dlp probe: never downloads media or exposes signed URLs."""
     from youtube_runtime import youtube_js_args
-    from urllib.parse import parse_qs
-    parsed = urlparse(url)
-    vid = parsed.path.strip('/').split('/')[0] if 'youtu.be' in parsed.netloc else parse_qs(parsed.query).get('v', [''])[0]
-    if not re.fullmatch(r'[A-Za-z0-9_-]{11}', vid):
-        raise ValueError('YouTube動画IDが見つかりません')
+    vid = youtube_video_id(url)
     target='https://www.youtube.com/watch?v='+vid
     js_args, js_description = youtube_js_args()
     version=subprocess.run([sys.executable,'-m','yt_dlp','--version'],capture_output=True,text=True,timeout=15).stdout.strip()
@@ -1150,7 +1165,7 @@ with st.expander("🔖 ブックマークレット：再生中のWebcastから�
 
 st.subheader("② 音声・動画URL")
 url = st.text_input("URL", key="webcast_url",
-                    placeholder="YouTube / Vimeo / Q4 videoRecordingLink / .mp3 / .m3u8 / .ts / IR Webcasting 等")
+                    placeholder="YouTube / Vimeo / Q4 videoRecordingLink / .mp3 / .m3u8 / .ts / IR Webcasting 等").strip()
 
 auto_meta = {"company":"", "period":"", "date":""}
 if url.strip() and is_irwebcasting(url.strip()):
