@@ -20,6 +20,31 @@ st.set_page_config(page_title="IR Webcast Transcriber", page_icon="🎧", layout
 if "code" in st.query_params or "error" in st.query_params:
     from google_drive_integration import _google_oauth_callback
     _google_oauth_callback()
+if "media" in st.query_params:
+    # Opened from the bookmarklet: pre-fill the media URL and go straight to the webcast page.
+    st.session_state["webcast_url"] = str(st.query_params.get("media", ""))
+    st.session_state["prefill_src"] = str(st.query_params.get("src", ""))[:500]
+    st.session_state["prefill_title"] = str(st.query_params.get("title", ""))[:200]
+    st.session_state["ir_page"] = "🎧 IR Webcast 文字起こし"
+    st.query_params.clear()
+
+
+def _app_password():
+    try:
+        return str(st.secrets.get("APP_PASSWORD", "") or "")
+    except Exception:
+        return ""
+
+
+if _app_password() and not st.session_state.get("app_unlocked"):
+    import hmac
+    entered = st.text_input("アプリのパスワード", type="password", key="app_password_input")
+    if entered and hmac.compare_digest(entered, _app_password()):
+        st.session_state["app_unlocked"] = True
+        st.rerun()
+    if entered:
+        st.error("パスワードが違います。")
+    st.stop()
 page = st.radio("機能を選択", ["📄 PDF → 全文翻訳 → Google Drive", "📑 Earnings + Follow-up 統合", "🎧 IR Webcast 文字起こし", "🌐 TXT・Google Docs 全文翻訳"], horizontal=True, key="ir_page")
 if page == "📄 PDF → 全文翻訳 → Google Drive":
     from pdf_pipeline import main as pdf_pipeline_main
@@ -357,7 +382,7 @@ def ffmpeg_get(url, out_path):
     ]
     direct = ffmpeg_base + [
         "-rw_timeout", "30000000", "-user_agent", UA,
-        "-headers", f"Referer: {parsed.scheme}://{parsed.netloc}/\\r\\n",
+        "-headers", f"Referer: {parsed.scheme}://{parsed.netloc}/\r\n",
         "-i", url,
     ] + encode_args
     try:
@@ -919,7 +944,7 @@ def translate_to_japanese(transcript, api_key, model="gpt-4o-mini", usage_stats=
         if len(remaining) <= 8500:
             chunks.append(remaining)
             break
-        split_at = remaining.rfind("\\n", 0, 8500)
+        split_at = remaining.rfind("\n", 0, 8500)
         if split_at < 3500:
             split_at = 8500
         chunks.append(remaining[:split_at])
@@ -1047,7 +1072,84 @@ def safe_filename(text):
     return text[:80] or "untagged"
 
 
-url = st.text_input("URL", placeholder="YouTube / Vimeo / Q4 videoRecordingLink / .mp3 / .m3u8 / .ts / IR Webcasting 等")
+def media_last_modified(media_url):
+    """Last-Modified of a direct media file: a hint for the call date (often absent for HLS)."""
+    try:
+        with requests.head(media_url, headers={"User-Agent": UA}, allow_redirects=True, timeout=(5, 10)) as r:
+            return r.headers.get("Last-Modified", "")
+    except requests.RequestException:
+        return ""
+
+
+def app_url():
+    try:
+        value = st.secrets.get("APP_URL", "")
+    except Exception:
+        value = ""
+    return str(value or "https://irwebcasttranscriber-2ytgsid2pfpmajk8qrvqvv.streamlit.app")
+
+
+import company_registry
+from google_drive_integration import google_login_panel, ensure_google_auth
+
+st.subheader("① 企業を選択")
+google_login_panel()
+companies = []
+if st.session_state.get("google_drive_tokens"):
+    try:
+        companies = company_registry.load_companies()
+    except Exception as exc:
+        st.warning(f"企業マスター（スプレッドシート）を読み込めません: {exc}")
+selected = None
+if companies:
+    labels = [company_registry.label(c) for c in companies]
+    if "company_select" not in st.session_state:
+        guessed = company_registry.guess_company(companies, st.session_state.get("prefill_title", ""),
+                                                 st.session_state.get("prefill_src", ""))
+        if guessed:
+            st.session_state["company_select"] = company_registry.label(guessed)
+    choice = st.selectbox("企業（企業マスターから選択すると保存先・ノートを自動設定）",
+                          ["（選択しない）"] + labels, key="company_select")
+    if choice in labels:
+        selected = companies[labels.index(choice)]
+if selected:
+    def _link(text, target):
+        return f"[{text}]({target})" if target.startswith("http") else f"{text}: 未設定"
+    st.markdown(" ／ ".join([_link("音声ページ", selected.get("audio_page", "")),
+                             _link("保存先 Quarterly_Analysis", selected.get("transcript_folder", "")),
+                             _link("05_決算分析ノート", selected.get("note_url", ""))]))
+    ir_page = selected.get("audio_page") or selected.get("results_url") or ""
+    if ir_page.startswith("http") and st.button("IRページから説明会の音声・Webcastを探す", key="find_webcast"):
+        from ir_discovery import find_webcast_candidates
+        try:
+            st.session_state["webcast_candidates"] = (selected["row"], find_webcast_candidates(ir_page))
+        except Exception as exc:
+            st.session_state["webcast_candidates"] = (selected["row"], [])
+            st.warning(f"自動探索できませんでした: {exc}")
+    found = st.session_state.get("webcast_candidates")
+    if found and found[0] == selected["row"]:
+        if found[1]:
+            options = [f"{c['text'][:90] or '(リンク文字なし)'} — {c['url']}" for c in found[1]]
+            picked = st.radio("候補（新しい順）。Webcastページを選ぶと、中の音声を自動探索します。", options,
+                              key="webcast_candidate_pick")
+            if st.button("このURLを使う", key="use_webcast_candidate"):
+                st.session_state["webcast_url"] = found[1][options.index(picked)]["url"]
+        else:
+            st.info("候補が見つかりませんでした。下のブックマークレットを使ってください。")
+
+with st.expander("🔖 ブックマークレット：再生中のWebcastから音声URLを取得してこのアプリを開く"):
+    st.markdown("1. ブラウザで新しいブックマークを作り、URL欄に下のコードを丸ごと貼り付けます（初回のみ）。\n"
+                "2. 決算説明会のWebcastページを開いて**再生を開始**し、そのブックマークをクリックします。\n"
+                "3. 音声URLが入力された状態でこのアプリが開きます。ページタイトルから企業も自動選択されます。")
+    from ir_discovery import bookmarklet
+    st.code(bookmarklet(app_url()), language="text")
+    st.caption("NVIDIAやBroadcomのようにIRサイトがサーバーからのアクセスを拒否する場合でも、"
+               "ご自身のブラウザ内で動くため取得できます。プレイヤーが別ドメインの枠内にある場合は、"
+               "その枠を新しいタブで開いてから実行してください。")
+
+st.subheader("② 音声・動画URL")
+url = st.text_input("URL", key="webcast_url",
+                    placeholder="YouTube / Vimeo / Q4 videoRecordingLink / .mp3 / .m3u8 / .ts / IR Webcasting 等")
 
 auto_meta = {"company":"", "period":"", "date":""}
 if url.strip() and is_irwebcasting(url.strip()):
@@ -1068,12 +1170,15 @@ elif url.strip():
 st.subheader("決算説明会タグ")
 m1, m2 = st.columns(2)
 with m1:
-    company = st.text_input("企業名", value=auto_meta.get("company", ""), placeholder="例: NVIDIA / SK hynix / Palantir")
+    company = st.text_input("企業名", value=(selected or {}).get("company") or auto_meta.get("company", ""),
+                            placeholder="例: NVIDIA / SK hynix / Palantir")
 with m2:
-    earnings_period = st.text_input("決算期", value=auto_meta.get("period", ""), placeholder="例: FY2027 Q2 / 2026年2Q")
+    earnings_period = st.text_input("決算期", value=auto_meta.get("period", ""),
+                                    placeholder="空欄なら文字起こしから自動判定（例: FY2027 Q2）")
 m3, m4 = st.columns(2)
 with m3:
-    earnings_date = st.text_input("説明会日", value=auto_meta.get("date", ""), placeholder="例: 2026-08-26")
+    earnings_date = st.text_input("説明会日", value=auto_meta.get("date", ""),
+                                  placeholder="空欄なら自動判定（例: 2026-08-26）")
 with m4:
     event_type = st.selectbox("種別", ["決算説明会", "決算発表", "Investor Day", "その他"], index=0)
 
@@ -1123,21 +1228,74 @@ if not ffmpeg_available():
 
 translate_enabled = st.checkbox("原文と日本語訳を両方作成する（翻訳API料金が別途発生）", value=True)
 st.subheader("Google DriveへGoogleドキュメントとして保存")
+selected_key = str((selected or {}).get("row", "none"))
 save_drive_enabled = st.checkbox(
     "文字起こし完了後、原文と日本語訳を指定フォルダに保存する",
-    value=False, key="transcription_save_drive"
+    value=bool(selected), key="transcription_save_drive_" + selected_key
 )
 if save_drive_enabled:
-    from google_drive_integration import google_login_panel
-    google_login_panel()
     drive_folder_url = st.text_input(
-        "保存先Google DriveフォルダのURL",key="transcription_drive_folder",
+        "保存先Google DriveフォルダのURL", value=(selected or {}).get("transcript_folder", ""),
+        key="transcription_drive_folder_" + selected_key,
         placeholder="https://drive.google.com/drive/u/0/folders/..."
     )
     st.caption("原文と日本語訳を別々のGoogleドキュメントとして作成します。"
                "日本語訳はJapanese_Translation_を名前の先頭に付けます。")
 else:
     drive_folder_url = ""
+st.session_state["last_drive_folder"] = drive_folder_url
+note_enabled = st.checkbox(
+    "日本語訳から4,000字以上の要約を作成し、05_決算分析ノートの先頭に追記する",
+    value=bool(selected and translate_enabled), disabled=not (selected and translate_enabled),
+    key="note_enabled_" + selected_key,
+    help="企業マスターで企業を選択し、日本語訳を有効にすると使えます。")
+analysis_model = st.text_input("要約モデル", value="gpt-4.1", key="analysis_model",
+                               help="長いスクリプトを一度に読めるモデルを指定してください。")
+
+
+def run_analysis_step(job, api_key):
+    """Summarize the translation and prepend it to the company's analysis note. Safe to retry."""
+    import analysis_note
+    from google_drive_integration import parse_folder_id
+    if not job.get("period"):
+        st.error("決算期を判定できなかったため、ノートに追記していません。下の欄で決算期を入力して再試行してください。")
+        return
+    if not job.get("analysis"):
+        st.info(f"{job['model']}で決算分析ノートの要約を作成中…（数分かかることがあります）")
+        usage = {}
+        job["analysis"] = analysis_note.generate_quarter_analysis(
+            api_key, job["model"], job["company"], job["period"], job["date"], job["translated"], usage)
+        job["usage"] = usage
+    analysis = job["analysis"]
+    if analysis["char_count"] < analysis_note.MIN_CHARS:
+        st.warning(f"要約が{analysis['char_count']:,}字で4,000字に届きませんでした。そのまま追記します。")
+    item = job["company_row"]
+    def folder_id(value):
+        try:
+            return parse_folder_id(value) if value else None
+        except ValueError:
+            return None
+    doc_id, created = analysis_note.resolve_note_doc(
+        item["company"], item.get("note_url", ""), folder_id(item.get("root_folder")),
+        folder_id(item.get("transcript_folder")))
+    doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
+    if created:
+        st.info(f"Googleドキュメント形式のノートを新規作成しました: {analysis_note.note_title(item['company'])}")
+        try:
+            company_registry.write_note_url(item, doc_url)
+            st.caption("企業マスターの05_決算分析ノート列を新しいURLに更新しました。")
+        except Exception as exc:
+            st.warning(f"企業マスターへのURL書き戻しに失敗しました（手動で更新してください）: {exc}")
+    outcome = analysis_note.prepend_quarter(doc_id, job["period"], job["date"], job["script_url"], analysis)
+    job["done"] = True
+    if outcome == "exists":
+        st.info(f"{job['period']} の章は既にノートにあるため追記しませんでした。")
+    else:
+        usage = job.get("usage") or {}
+        st.success(f"05_決算分析ノートに {job['period']} を追記しました（{analysis['char_count']:,}字・"
+                   f"論点{len(analysis['sections'])}個、入力{usage.get('input_tokens', 0):,}／"
+                   f"出力{usage.get('output_tokens', 0):,}トークン）。")
+    st.markdown(f"[05_決算分析ノートを開く]({doc_url})")
 
 
 with st.expander("API料金設定（概算・USD）"):
@@ -1213,6 +1371,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
             td = Path(td)
             audio = td / "webcast.mp3"
             direct_caption_text = None
+            translation_doc_url = ""
             source_kind = kind(url)
 
             if uploaded_media is not None:
@@ -1320,6 +1479,24 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
                     progress_bar=progress_bar, progress_text=progress_text, usage_stats=transcribe_usage,
                 )
 
+            if not earnings_period.strip() or not earnings_date.strip():
+                status.info("決算期・説明会日をスクリプトから判定中…")
+                hints = "\n".join(x for x in [
+                    f"URL: {url}", f"Page title: {st.session_state.get('prefill_title', '')}",
+                    f"Webcast page: {st.session_state.get('prefill_src', '')}",
+                    f"Media Last-Modified: {media_last_modified(url) if url.strip() else ''}",
+                    f"Uploaded file: {uploaded_media.name if uploaded_media is not None else ''}"]
+                    if not x.endswith(": "))
+                try:
+                    from analysis_note import extract_call_metadata
+                    detected = extract_call_metadata(api_key, "gpt-4.1-mini", company.strip(), text, hints)
+                    earnings_period = earnings_period.strip() or detected["fiscal_period"]
+                    earnings_date = earnings_date.strip() or detected["event_date"]
+                    st.caption(f"自動判定: 決算期 {detected['fiscal_period'] or '不明'} ／ 説明会日 "
+                               f"{detected['event_date'] or '不明'}（根拠: {detected['evidence'][:200]}）")
+                except Exception as exc:
+                    st.warning(f"決算期・説明会日の自動判定に失敗しました: {exc}")
+
             tags = []
             if company.strip(): tags.append(f"企業名: {company.strip()}")
             if earnings_period.strip(): tags.append(f"決算期: {earnings_period.strip()}")
@@ -1382,7 +1559,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
                 try:
                     from google_drive_integration import parse_folder_id, upload_as_google_doc, existing_google_doc
                     folder_id=parse_folder_id(drive_folder_url)
-                    if not st.session_state.get("google_drive_tokens"):
+                    if not ensure_google_auth():
                         raise RuntimeError("Googleアカウントでログインしてください。")
                     docs_to_save=[(f"{base_name}_transcript.txt",transcript_with_tags)]
                     if translate_enabled:
@@ -1394,8 +1571,21 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
                             doc=upload_as_google_doc(folder_id,doc_filename,doc_text)
                         st.success(f"Google Drive保存完了: {doc_title}")
                         st.markdown(f"[Googleドキュメントを開く](https://docs.google.com/document/d/{doc['id']}/edit)")
+                        if doc_title.startswith("Japanese_Translation_"):
+                            translation_doc_url = f"https://docs.google.com/document/d/{doc['id']}/edit"
                 except Exception as drive_exc:
                     st.warning(f"自動保存できませんでした: {drive_exc}。下部から再試行できます。")
+            if note_enabled and translate_enabled and selected:
+                st.session_state["pending_analysis"] = {
+                    "company": selected["company"], "company_row": selected,
+                    "period": earnings_period.strip(), "date": earnings_date.strip(),
+                    "translated": japanese_translation, "model": analysis_model,
+                    "script_url": translation_doc_url,
+                }
+                try:
+                    run_analysis_step(st.session_state["pending_analysis"], api_key)
+                except Exception as note_exc:
+                    st.warning(f"決算分析ノートへの追記に失敗しました: {note_exc}。下部から再試行できます。")
             transcription_cost = billed_audio_minutes * transcribe_usd_min
             translation_cost = (
                 translation_usage["input_tokens"] * translation_in_per_m
@@ -1452,12 +1642,12 @@ if st.session_state.get("pending_drive_transcript"):
     else:
         st.warning("日本語訳は未生成です。原文のみ保存します。")
     from google_drive_integration import parse_folder_id, upload_as_google_doc, existing_google_doc
-    folder_for_upload=st.text_input("保存先フォルダURL",value=st.session_state.get("transcription_drive_folder",""),
+    folder_for_upload=st.text_input("保存先フォルダURL",value=st.session_state.get("last_drive_folder",""),
                                     key="transcription_upload_folder")
     if st.button("Google Driveにアップロード",type="primary",key="upload_transcripts_drive"):
         try:
             folder_id=parse_folder_id(folder_for_upload)
-            if not st.session_state.get("google_drive_tokens"):
+            if not ensure_google_auth():
                 raise RuntimeError("先にGoogleアカウントでログインしてください。")
             items=[(result["original_name"],result["original"])]
             if result["translated"] is not None:
@@ -1477,6 +1667,24 @@ if st.session_state.get("pending_drive_transcript"):
             st.error(f"アップロードに失敗しました: {exc}")
     st.caption("アップロードに失敗しても翻訳を再実行する必要はありません。"
                "この画面の結果から再試行できます。同名のGoogleドキュメントは再作成しません。")
+
+if st.session_state.get("pending_analysis") and not st.session_state["pending_analysis"].get("done"):
+    job = st.session_state["pending_analysis"]
+    st.divider()
+    st.subheader("05_決算分析ノートへの追記（再試行）")
+    st.caption("翻訳済みの結果を使うので、文字起こし・翻訳はやり直しません。要約が作成済みなら要約も再利用します。")
+    r1, r2 = st.columns(2)
+    with r1:
+        job["period"] = st.text_input("決算期", value=job.get("period", ""), key="retry_period")
+    with r2:
+        job["date"] = st.text_input("説明会日（YYYY-MM-DD）", value=job.get("date", ""), key="retry_date")
+    job["script_url"] = st.text_input("参照スクリプトURL（Japanese_TranslationのGoogleドキュメント）",
+                                      value=job.get("script_url", ""), key="retry_script_url")
+    if st.button("要約・ノート追記を再試行", type="primary", key="retry_analysis"):
+        try:
+            run_analysis_step(job, api_key)
+        except Exception as exc:
+            st.error(f"追記に失敗しました: {exc}")
 
 with st.expander("対応機能"):
     st.markdown("""

@@ -18,6 +18,32 @@ def _google_settings():
         return str(values.get(name, os.getenv(name, ""))).strip()
     return setting("GOOGLE_CLIENT_ID"), setting("GOOGLE_CLIENT_SECRET"), setting("GOOGLE_REDIRECT_URI"), setting("GOOGLE_OAUTH_STATE_SECRET")
 
+def _secret_refresh_token():
+    """Long-lived refresh token in Secrets removes the per-session Google login."""
+    try:
+        value = st.secrets.get("GOOGLE_REFRESH_TOKEN", "")
+    except Exception:
+        value = ""
+    return str(value or os.getenv("GOOGLE_REFRESH_TOKEN", "")).strip()
+
+def ensure_google_auth():
+    """Return True when Drive calls can proceed, using Secrets if no session login."""
+    if st.session_state.get("google_drive_tokens"):
+        return True
+    refresh = _secret_refresh_token()
+    if not refresh:
+        return False
+    # expires_at=0 makes _google_access_token refresh immediately.
+    st.session_state["google_drive_tokens"] = {"access_token": "pending", "refresh_token": refresh,
+                                               "expires_at": 0, "from_secrets": True}
+    try:
+        _google_access_token()
+        return True
+    except Exception as exc:
+        st.session_state.pop("google_drive_tokens", None)
+        st.warning(f"SecretsのGOOGLE_REFRESH_TOKENで接続できませんでした: {exc}")
+        return False
+
 def _google_signer():
     _, _, _, secret = _google_settings()
     if not secret or len(secret) < 24:
@@ -119,8 +145,19 @@ def _google_access_token():
 def google_login_panel():
     st.subheader("Google Drive接続")
     _google_oauth_callback()
+    if st.session_state.get("google_drive_tokens", {}).get("from_secrets") or (
+            not st.session_state.get("google_drive_tokens") and ensure_google_auth()):
+        st.success("Google Driveに自動接続済み（SecretsのGOOGLE_REFRESH_TOKEN）")
+        return
     if st.session_state.get("google_drive_tokens"):
         st.success("Google Driveに接続済み")
+        refresh = st.session_state["google_drive_tokens"].get("refresh_token")
+        if refresh:
+            with st.expander("次回からログイン不要にする（初回のみ）"):
+                st.caption("以下をStreamlit CloudのSecretsに GOOGLE_REFRESH_TOKEN として保存すると、"
+                           "以後Googleログインが不要になります。第三者に共有しないでください。"
+                           "保存する場合は、アプリを非公開にするか APP_PASSWORD を設定してください。")
+                st.code(f'GOOGLE_REFRESH_TOKEN = "{refresh}"', language="toml")
         if st.button("Google Driveからログアウト",key="google_drive_logout"):
             st.session_state.pop("google_drive_tokens",None)
             st.rerun()
@@ -180,3 +217,20 @@ def existing_google_doc(folder_id, title):
     },headers={"Authorization":f"Bearer {token}"},timeout=30)
     response.raise_for_status()
     return (response.json().get("files") or [None])[0]
+
+def google_api(method, url, **kwargs):
+    """Authorized call to any Google REST API (Drive / Docs / Sheets) with readable errors."""
+    if not ensure_google_auth():
+        raise RuntimeError("Google Driveに接続されていません。ログインするか GOOGLE_REFRESH_TOKEN を設定してください。")
+    headers = {"Authorization": f"Bearer {_google_access_token()}", **kwargs.pop("headers", {})}
+    response = requests.request(method, url, headers=headers, timeout=kwargs.pop("timeout", 60), **kwargs)
+    if not response.ok:
+        raise RuntimeError(f"Google API HTTP {response.status_code}: {response.text[:600]}")
+    return response.json() if response.content else {}
+
+def parse_doc_id(url):
+    """Accept docs.google.com/document/d/<id> and drive.google.com/file/d/<id> links."""
+    match = re.search(r"/(?:document|file)/d/([A-Za-z0-9_-]+)", (url or "").strip())
+    if not match:
+        raise ValueError(f"GoogleドキュメントのURLを認識できません: {url}")
+    return match.group(1)
