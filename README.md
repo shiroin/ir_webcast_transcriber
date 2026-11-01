@@ -64,7 +64,29 @@ APP_URL = "https://irwebcasttranscriber-2ytgsid2pfpmajk8qrvqvv.streamlit.app"   
 
 決算期・説明会日は空欄のままで構いません（判定結果と根拠が画面に表示されます）。判定できなかった場合や修正したい場合は、画面下部の「05_決算分析ノートへの追記（再試行）」で修正してから追記できます。再試行時に文字起こし・翻訳はやり直しません。
 
-## YouTubeの説明会はMac版で処理する
+## YouTubeの説明会：URLを貼ってボタンを押すだけ（推奨）
+
+YouTubeはCloud版のサーバーをブロック（403）しますが、自宅などのMacからは取得できます。そこで、Mac版をログイン時に自動起動させておき、Cloud版から処理を渡します。
+
+**初回だけ**：GitHubからダウンロードしたフォルダの `install_mac_autostart.command` をダブルクリックします（事前に `start_mac.command` でSecretsを設定しておくこと）。以後、Mac版は `http://localhost:8501` で常に起動しています。解除は `uninstall_mac_autostart.command`。新しい版をダウンロードしたら、もう一度 `install_mac_autostart.command` を実行すると更新されます。
+
+**毎回**：Cloud版にYouTubeのURLを貼る →「🖥️ Macで自動処理する」を押す。Mac版が開き、動画タイトルから企業を判定して、文字起こし → 決算期・説明会日の判定 → 日本語訳 → Drive保存 → 決算分析ノート追記まで自動で進みます。企業を判定できなかったときだけ、企業を選んで「文字起こし開始」を押します。Mac版（`http://localhost:8501`）に直接URLを貼って「文字起こし開始」を押しても同じです。
+
+- 自動実行の依頼は、Cloud版とMac版の両方のSecretsにある `GOOGLE_OAUTH_STATE_SECRET` で署名しています。他のサイトのリンクからMac版が勝手に処理を始めることはありません（両方のSecretsで同じ値にしておくこと）。
+- Mac版は自分のMacからのみアクセスでき、同じネットワークの他の端末には公開されません。
+- 処理中はMacをスリープさせないでください。ログは `~/Library/Application Support/IRWebcastTranscriber/logs/app.log`。
+
+## YouTubeの説明会：音声をダウンロードしてアップロードする（Macが使えない場合）
+
+Cloud版はYouTubeから直接取得できない（403）ため、YouTubeのURLを貼ると直接取得はせず、アップロードを案内します。
+
+1. Cloud版の「② 音声・動画URL」にYouTubeのURLを貼ります。動画タイトルが表示され、タイトルから企業が自動で選ばれます（未選択のときのみ）。
+2. Macで `download_youtube_mac.command` をダブルクリックし、同じURLを貼ります。音声MP3（モノラル64kbps、1時間で約30MB）が「ダウンロード/YouTube音声」に、`公開日_タイトル.mp3` の名前で保存され、Finderで表示されます。
+3. Cloud版の「YouTube取得診断・ローカルファイル代替」にそのMP3をアップロードし、「文字起こし開始」を押します。文字起こし → 決算期・説明会日の判定（動画タイトルとファイル名の公開日も手掛かりにする）→ 日本語訳 → Drive保存 → 決算分析ノート追記まで、URLのときと同じ流れで進みます。元のYouTube URLは参照元として記録されます。
+
+ほかの方法で保存した音声・動画ファイルでもアップロードできます（上限200MB。動画より音声のみの方が軽く確実です）。`download_youtube_mac.command` が開けない場合は、`start_mac.command` と同じく `chmod +x` を実行してください。
+
+## YouTubeの説明会をMac版で処理する（別の方法）
 
 YouTubeは、Streamlit Cloudのような共有サーバーからのアクセスをブロックします（403・ログイン要求）。一方、自宅などの回線からは取得できます。そのためYouTubeのときだけ、同じアプリをMac上で動かします。画面・企業マスター・Drive保存・ノート追記はCloud版と同じです。
 

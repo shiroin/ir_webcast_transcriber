@@ -20,9 +20,30 @@ st.set_page_config(page_title="IR Webcast Transcriber", page_icon="🎧", layout
 if "code" in st.query_params or "error" in st.query_params:
     from google_drive_integration import _google_oauth_callback
     _google_oauth_callback()
+def autostart_signature(media_url):
+    """HMAC over the media URL with the shared OAuth state secret (set in both Cloud and Mac Secrets).
+
+    Only the Cloud app's "Macで自動処理" button can produce it, so other sites linking to
+    localhost cannot start paid processing on the Mac app."""
+    import hashlib
+    import hmac
+    try:
+        secret = str(st.secrets.get("GOOGLE_OAUTH_STATE_SECRET", "") or "")
+    except Exception:
+        secret = ""
+    if len(secret) < 24:
+        return ""
+    return hmac.new(secret.encode(), ("autostart:" + media_url).encode(), hashlib.sha256).hexdigest()[:32]
+
+
 if "media" in st.query_params:
-    # Opened from the bookmarklet: pre-fill the media URL and go straight to the webcast page.
-    st.session_state["webcast_url"] = str(st.query_params.get("media", ""))
+    # Opened from the bookmarklet or the Cloud app's Mac button: pre-fill and go to the webcast page.
+    import hmac as _hmac
+    _media = str(st.query_params.get("media", ""))
+    _sig = autostart_signature(_media)
+    st.session_state["autostart_requested"] = bool(
+        _sig and _hmac.compare_digest(_sig, str(st.query_params.get("auto", ""))))
+    st.session_state["webcast_url"] = _media
     st.session_state["prefill_src"] = str(st.query_params.get("src", ""))[:500]
     st.session_state["prefill_title"] = str(st.query_params.get("title", ""))[:200]
     st.session_state["ir_page"] = "🎧 IR Webcast 文字起こし"
@@ -1105,6 +1126,31 @@ def app_url():
     return str(value or "https://irwebcasttranscriber-2ytgsid2pfpmajk8qrvqvv.streamlit.app")
 
 
+def youtube_direct_ok():
+    """YouTube blocks shared cloud servers (403); only fetch directly on a home Mac/PC."""
+    import platform
+    return platform.system() in ("Darwin", "Windows")
+
+
+def youtube_info(video_url):
+    """Title and channel via YouTube's public oEmbed endpoint (no media download). Cached per URL."""
+    cache = st.session_state.setdefault("youtube_info_cache", {})
+    if video_url in cache:
+        return cache[video_url]
+    info = {}
+    try:
+        r = requests.get("https://www.youtube.com/oembed",
+                         params={"url": "https://www.youtube.com/watch?v=" + youtube_video_id(video_url),
+                                 "format": "json"}, headers={"User-Agent": UA}, timeout=10)
+        if r.ok:
+            data = r.json()
+            info = {"title": data.get("title", ""), "channel": data.get("author_name", "")}
+    except Exception:
+        pass
+    cache[video_url] = info
+    return info
+
+
 import company_registry
 from google_drive_integration import google_login_panel, ensure_google_auth
 
@@ -1119,9 +1165,13 @@ if st.session_state.get("google_drive_tokens"):
 selected = None
 if companies:
     labels = [company_registry.label(c) for c in companies]
-    if "company_select" not in st.session_state:
+    pending_url = str(st.session_state.get("webcast_url", "")).strip()
+    yt = youtube_info(pending_url) if is_youtube(pending_url) else {}
+    # Fill only when nothing is chosen yet, so a manual choice is never overwritten.
+    if st.session_state.get("company_select") in (None, "（選択しない）"):
         guessed = company_registry.guess_company(companies, st.session_state.get("prefill_title", ""),
-                                                 st.session_state.get("prefill_src", ""))
+                                                 st.session_state.get("prefill_src", ""),
+                                                 yt.get("title", ""), yt.get("channel", ""))
         if guessed:
             st.session_state["company_select"] = company_registry.label(guessed)
     choice = st.selectbox("企業（企業マスターから選択すると保存先・ノートを自動設定）",
@@ -1167,8 +1217,37 @@ st.subheader("② 音声・動画URL")
 url = st.text_input("URL", key="webcast_url",
                     placeholder="YouTube / Vimeo / Q4 videoRecordingLink / .mp3 / .m3u8 / .ts / IR Webcasting 等").strip()
 
+youtube_meta = youtube_info(url) if is_youtube(url) else {}
+if is_youtube(url):
+    if youtube_meta.get("title"):
+        st.caption(f"YouTube動画：{youtube_meta['title']}（{youtube_meta.get('channel', '')}）")
+    if not youtube_direct_ok():
+        from urllib.parse import urlencode
+        try:
+            mac_app = str(st.secrets.get("MAC_APP_URL", "") or "http://localhost:8501")
+        except Exception:
+            mac_app = "http://localhost:8501"
+        signature = autostart_signature(url)
+        if signature:
+            st.link_button("🖥️ Macで自動処理する（文字起こし → 日本語訳 → Drive保存 → ノート追記）",
+                           mac_app.rstrip("/") + "/?" + urlencode({"media": url, "auto": signature}),
+                           type="primary", use_container_width=True)
+            st.caption("Mac版（ログイン時に自動起動）が開き、企業を自動判定できればそのまま最後まで処理します。"
+                       "判定できない場合は企業を選んで「文字起こし開始」を押してください。")
+        else:
+            st.warning("Secretsの GOOGLE_OAUTH_STATE_SECRET（24文字以上）がないため、Mac自動処理ボタンを表示できません。")
+        with st.expander("Macが使えない場合：音声ファイルを手動でアップロードする"):
+            st.info("YouTubeはこのサーバーから直接取得できません（YouTube側が403でブロックします）。\n\n"
+                    "1. Macで **download_youtube_mac.command** をダブルクリックし、このURLを貼ると、"
+                    "音声MP3が「ダウンロード/YouTube音声」に保存されます（ほかの方法で保存した音声・動画ファイルでも可）。\n"
+                    "2. 下の「**YouTube取得診断・ローカルファイル代替**」にそのファイルをアップロードします。\n"
+                    "3. 「文字起こし開始」を押すと、文字起こし → 日本語訳 → Drive保存 → 決算分析ノート追記まで進みます。"
+                    "このURLは参照元として記録し、動画タイトルは決算期の判定に使います。")
+
 auto_meta = {"company":"", "period":"", "date":""}
-if url.strip() and is_irwebcasting(url.strip()):
+if url.strip() and is_youtube(url):
+    pass  # YouTube pages carry no IR metadata; the title above is used as a hint instead.
+elif url.strip() and is_irwebcasting(url.strip()):
     try:
         auto_meta = extract_irwebcasting_metadata(url.strip())
         st.caption("IR Webcastingを検出：企業名・決算期・説明会日を自動取得します。")
@@ -1359,19 +1438,32 @@ if is_youtube(url) and st.session_state.get('youtube_last_diagnostic'):
                        file_name='youtube_diagnostic.json',mime='application/json')
 
 uploaded_media=st.file_uploader(
-    "音声・動画ファイルをアップロード（YouTubeの403を回避する代替入力）",
+    "音声・動画ファイルをアップロード（YouTubeの場合はこちら）",
     type=['mp3','m4a','wav','mp4','webm','mov','aac','flac','ogg'],
     key='transcription_media_upload',
-    help='ご自身が利用権限を持つファイルをアップロードしてください。最大1GB。')
+    help='ご自身が利用権限を持つファイルをアップロードしてください。動画より音声のみ（MP3/M4A）の方が軽く確実です。')
 if uploaded_media is not None:
-    st.info('アップロードしたファイルを優先して文字起こしします。YouTubeへのアクセスは行いません。')
+    st.info('アップロードしたファイルを優先して文字起こしします。YouTubeへのアクセスは行いません。'
+            + ('上のYouTube URLは参照元として記録します。' if is_youtube(url) else ''))
 
-if st.button("文字起こし開始", type="primary", use_container_width=True):
+auto_run = False
+if st.session_state.pop("autostart_requested", False):
+    if url and api_key and (selected or not companies):
+        auto_run = True
+        st.info("Cloud版からの依頼により、自動で処理を開始しました。完了までこの画面を閉じないでください。")
+    else:
+        st.warning("企業を自動判定できませんでした。企業を選んで「文字起こし開始」を押してください。")
+
+if st.button("文字起こし開始", type="primary", use_container_width=True) or auto_run:
     if not url.strip() and uploaded_media is None:
         st.warning("URLを貼るか、音声・動画ファイルをアップロードしてください。")
         st.stop()
     if not api_key:
         st.error("OpenAI API Key が必要です。画面に入力するか、Streamlit Secrets に OPENAI_API_KEY を設定してください。")
+        st.stop()
+    if uploaded_media is None and is_youtube(url) and not youtube_direct_ok():
+        st.warning("YouTubeは直接取得できないため、音声ファイルをダウンロードして"
+                   "「YouTube取得診断・ローカルファイル代替」にアップロードしてから、もう一度押してください。")
         st.stop()
     if uploaded_media is None and (is_youtube(url) or is_vimeo(url)) and not yt_dlp_available():
         st.error("yt-dlp が見つかりません。requirements.txt を確認してください。")
@@ -1393,7 +1485,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
             if uploaded_media is not None:
                 status.info('アップロードされた音声・動画から音声抽出中…')
                 audio=transcode_uploaded_audio(uploaded_media,audio)
-                source='Uploaded media: '+Path(uploaded_media.name).name
+                source='Uploaded media: '+Path(uploaded_media.name).name+(' (YouTube)' if is_youtube(url) else '')
             elif is_gridow_page(url):
                 status.info("Gridowの埋め込みプレイヤーを解析中…（yt-dlp → iframe → HLS/MP4）")
                 audio = gridow_audio_get(url, audio)
@@ -1500,7 +1592,9 @@ if st.button("文字起こし開始", type="primary", use_container_width=True):
                 hints = "\n".join(x for x in [
                     f"URL: {url}", f"Page title: {st.session_state.get('prefill_title', '')}",
                     f"Webcast page: {st.session_state.get('prefill_src', '')}",
-                    f"Media Last-Modified: {media_last_modified(url) if url.strip() else ''}",
+                    f"YouTube title: {youtube_meta.get('title', '')} / channel: {youtube_meta.get('channel', '')}"
+                    if youtube_meta.get("title") else "YouTube title: ",
+                    f"Media Last-Modified: {media_last_modified(url) if url.strip() and not is_youtube(url) else ''}",
                     f"Uploaded file: {uploaded_media.name if uploaded_media is not None else ''}"]
                     if not x.endswith(": "))
                 try:

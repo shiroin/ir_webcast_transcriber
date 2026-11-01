@@ -63,4 +63,5 @@ fi
 
 echo "アプリを起動します。ブラウザが自動で開きます（開かない場合は http://localhost:8501 ）。"
 echo "終了するときは、このウィンドウを閉じてください。"
-exec "$VENV/bin/python" -m streamlit run app.py --server.port 8501 --browser.gatherUsageStats false
+# リポジトリの .streamlit/config.toml は Cloud 用に headless=true なので、ここで上書きしてブラウザを開く。
+exec "$VENV/bin/python" -m streamlit run app.py --server.port 8501 --server.address localhost --server.headless false --browser.gatherUsageStats false
