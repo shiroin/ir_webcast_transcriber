@@ -26,9 +26,44 @@ def _secret_refresh_token():
         value = ""
     return str(value or os.getenv("GOOGLE_REFRESH_TOKEN", "")).strip()
 
+def _bridge_settings():
+    """Apps Script token bridge: works while the OAuth consent screen stays in "Testing"."""
+    def setting(name):
+        try:
+            value = st.secrets.get(name, "")
+        except Exception:
+            value = ""
+        return str(value or os.getenv(name, "")).strip()
+    return setting("GOOGLE_BRIDGE_URL"), setting("GOOGLE_BRIDGE_SECRET")
+
+def _bridge_token():
+    """Fetch a ~1 hour access token from the user's own Apps Script web app (apps_script/Code.gs)."""
+    url, secret = _bridge_settings()
+    # Apps Script answers POST with a redirect to the result; requests follows it with GET.
+    response = requests.post(url, json={"secret": secret}, timeout=30)
+    try:
+        data = response.json()
+    except ValueError:
+        raise RuntimeError("Apps Scriptから応答を読み取れません。ウェブアプリのアクセスできるユーザーが"
+                           "「全員」になっているか、URLが /exec で終わっているか確認してください。")
+    if data.get("error") == "unauthorized":
+        raise RuntimeError("Apps Scriptの合言葉が一致しません。SecretsのGOOGLE_BRIDGE_SECRETを確認してください。")
+    if not data.get("access_token"):
+        raise RuntimeError(f"Apps Scriptからトークンを受け取れませんでした: {str(data)[:200]}")
+    return data["access_token"], time.time() + int(data.get("expires_in", 3000))
+
 def ensure_google_auth():
-    """Return True when Drive calls can proceed, using Secrets if no session login."""
+    """Return True when Drive calls can proceed: session login, Apps Script bridge, or refresh token."""
     if st.session_state.get("google_drive_tokens"):
+        return True
+    if all(_bridge_settings()):
+        try:
+            access, expires_at = _bridge_token()
+        except Exception as exc:
+            st.warning(f"Apps Script経由でGoogleに接続できませんでした: {exc}")
+            return False
+        st.session_state["google_drive_tokens"] = {"access_token": access, "expires_at": expires_at,
+                                                   "from_bridge": True}
         return True
     refresh = _secret_refresh_token()
     if not refresh:
@@ -124,6 +159,10 @@ def _google_access_token():
         raise RuntimeError("Googleアカウントでログインしてください。")
     if time.time()<float(tokens.get("expires_at",0))-90:
         return access
+    if tokens.get("from_bridge"):
+        tokens["access_token"], tokens["expires_at"] = _bridge_token()
+        st.session_state["google_drive_tokens"] = tokens
+        return tokens["access_token"]
     refresh=tokens.get("refresh_token")
     if not refresh:
         st.session_state.pop("google_drive_tokens",None)
@@ -145,9 +184,11 @@ def _google_access_token():
 def google_login_panel():
     st.subheader("Google Drive接続")
     _google_oauth_callback()
-    if st.session_state.get("google_drive_tokens", {}).get("from_secrets") or (
-            not st.session_state.get("google_drive_tokens") and ensure_google_auth()):
-        st.success("Google Driveに自動接続済み（SecretsのGOOGLE_REFRESH_TOKEN）")
+    tokens = st.session_state.get("google_drive_tokens") or {}
+    if tokens.get("from_bridge") or tokens.get("from_secrets") or (not tokens and ensure_google_auth()):
+        via = ("Apps Script" if st.session_state["google_drive_tokens"].get("from_bridge")
+               else "SecretsのGOOGLE_REFRESH_TOKEN")
+        st.success(f"Google Driveに自動接続済み（{via}）")
         return
     if st.session_state.get("google_drive_tokens"):
         st.success("Google Driveに接続済み")
