@@ -64,6 +64,27 @@ APP_URL = "https://irwebcasttranscriber-2ytgsid2pfpmajk8qrvqvv.streamlit.app"   
 
 決算期・説明会日は空欄のままで構いません（判定結果と根拠が画面に表示されます）。判定できなかった場合や修正したい場合は、画面下部の「05_決算分析ノートへの追記（再試行）」で修正してから追記できます。再試行時に文字起こし・翻訳はやり直しません。
 
+## YouTubeの説明会はMac版で処理する
+
+YouTubeは、Streamlit Cloudのような共有サーバーからのアクセスをブロックします（403・ログイン要求）。一方、自宅などの回線からは取得できます。そのためYouTubeのときだけ、同じアプリをMac上で動かします。画面・企業マスター・Drive保存・ノート追記はCloud版と同じです。
+
+**初回だけ**
+1. GitHubのリポジトリページで「Code → Download ZIP」を押し、展開します（`workflow_utils.py` を含む全ファイルが必要なため、このZIPではなくGitHubからダウンロードします）。
+2. 展開したフォルダの `start_mac.command` をダブルクリックします。
+   - 「開発元を確認できないため開けません」と出た場合は、右クリック →「開く」→「開く」を選びます。
+   - 「アクセス権がない」旨の表示が出る場合（GitHubのWeb画面でアップロードすると実行権限が外れるため）は、ターミナルで `chmod +x ` と入力してからファイルをターミナルにドラッグし、Enterを押してください。1回だけで済みます。
+3. テキストエディットで `~/.streamlit/secrets.toml` が開きます。Streamlit CloudのSecretsの内容をそのまま貼り付けて保存します。`GOOGLE_REFRESH_TOKEN` は必須です（Mac版ではGoogleログインボタンが使えないため）。
+4. もう一度 `start_mac.command` をダブルクリックします。初回は必要なものをインストールするので数分かかり、終わるとブラウザでアプリが開きます。
+
+**毎回**
+- `start_mac.command` をダブルクリック → ブラウザで開いたアプリに企業を選び、YouTubeのURLを貼って「文字起こし開始」。
+- 終了するときは、起動時に開いたターミナルのウィンドウを閉じます。
+
+補足
+- Python環境は `~/Library/Application Support/IRWebcastTranscriber/`、Secretsは `~/.streamlit/secrets.toml` に置きます。どちらもリポジトリの外なので、GitHubに上がることはありません。
+- YouTube取得に必要なDeno（JavaScript実行環境）は、初回のYouTube処理時に自動でダウンロードされます。
+- `python3` と `ffmpeg` が必要です（このMacには両方あります）。
+
 ## 05_決算分析ノートへの書き込み仕様
 
 - 対象：AD列のGoogleドキュメント。AD列が空・ゴミ箱・**.md等のGoogleドキュメント以外**の場合は、企業ルートフォルダ（AA列「フォルダ」＝Quarterly_Analysisの1つ上）に `05_決算分析ノート_企業名` をGoogleドキュメント形式で新規作成し、AD列を新しいURLに書き換えます（元の.mdは削除しません）。

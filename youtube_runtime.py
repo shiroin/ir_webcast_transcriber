@@ -6,7 +6,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -42,9 +41,11 @@ def _install_deno():
     """
     machine = platform.machine().lower()
     system = platform.system().lower()
-    if system != 'linux' or machine not in ('x86_64', 'amd64', 'aarch64', 'arm64'):
+    if system not in ('linux', 'darwin') or machine not in ('x86_64', 'amd64', 'aarch64', 'arm64'):
         raise RuntimeError(f'Deno自動導入の対象外: {system}/{machine}')
-    target = 'x86_64-unknown-linux-gnu' if machine in ('x86_64', 'amd64') else 'aarch64-unknown-linux-gnu'
+    # darwin: the local Mac version (YouTube blocks Streamlit Cloud's shared IPs, not home networks).
+    arch = 'x86_64' if machine in ('x86_64', 'amd64') else 'aarch64'
+    target = f'{arch}-apple-darwin' if system == 'darwin' else f'{arch}-unknown-linux-gnu'
     root = Path(tempfile.gettempdir()) / 'ir_transcriber_deno'
     root.mkdir(parents=True, exist_ok=True)
     binary = root / 'deno'
@@ -53,13 +54,15 @@ def _install_deno():
     url = f'https://github.com/denoland/deno/releases/download/v2.5.6/deno-{target}.zip'
     archive = root / 'deno.zip'
     try:
-        request = urllib.request.Request(url, headers={'User-Agent': 'IR-Webcast-Transcriber/1.0'})
-        with urllib.request.urlopen(request, timeout=25) as response, archive.open('wb') as output:
+        # requests ships certifi; python.org builds on macOS often lack system CA certs for urllib.
+        import requests
+        with requests.get(url, headers={'User-Agent': 'IR-Webcast-Transcriber/1.0'},
+                          stream=True, timeout=(15, 60)) as response, archive.open('wb') as output:
+            response.raise_for_status()
             total = 0
-            while True:
-                chunk = response.read(1024 * 1024)
+            for chunk in response.iter_content(1024 * 1024):
                 if not chunk:
-                    break
+                    continue
                 total += len(chunk)
                 if total > 100 * 1024 * 1024:
                     raise RuntimeError('Denoの配布ファイルが100MBを超えました')

@@ -473,7 +473,8 @@ def yt_dlp_audio_get(url, out_path):
     raise RuntimeError('YouTubeの音声取得に失敗しました。JS環境: '+js_description+'。\n'
                        +'\n'.join(errors[-2:])+'\n'
                        +'403が続く場合、Streamlit Cloudの共有IPに対するYouTube側の制限の可能性があります。'
-                       +'JS環境だけでは解除できません。')
+                       +'JS環境だけでは解除できません。'
+                       +'YouTubeはMac版（フォルダ内の start_mac.command をダブルクリック）で処理してください。')
 
 
 
