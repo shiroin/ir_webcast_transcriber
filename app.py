@@ -308,9 +308,86 @@ def gridow_audio_get(page_url, out_path):
 
 
 def is_caption_m3u8(url):
-    """Q4等の字幕HLS manifestをURLから早期判定。"""
-    u = url.lower()
-    return u.endswith(".m3u8") and any(x in u for x in ("/captions/", "subtitle", "subtitles", "caption"))
+    """Q4等の字幕HLS manifestをURLから早期判定（?token=… 付きの署名URLも対象）。"""
+    path = urlparse(url).path.lower()
+    return path.endswith(".m3u8") and any(x in path for x in ("/captions/", "subtitle", "caption"))
+
+
+Q4_DVR = "https://dvr.events.q4inc.com"
+
+
+def q4_meeting_id(url):
+    """events.q4inc.com/attendee/<id> → <id> (the meeting ID the Q4 player uses for its replay)."""
+    parsed = urlparse((url or "").strip())
+    if (parsed.hostname or "").lower() != "events.q4inc.com":
+        return ""
+    match = re.search(r"/attendee/(\d{5,})", parsed.path)
+    return match.group(1) if match else ""
+
+
+def q4_event_media(meeting_id):
+    """Replay HLS of a Q4 event, resolved the same way the Q4 player does (no registration needed).
+
+    dvr.events.q4inc.com/<id>/recording-started-latest.json gives masterKey; the playable URL is
+    the DVR host plus masterKey without its first three segments (ivs/v1/<account>)."""
+    r = requests.get(f"{Q4_DVR}/{meeting_id}/recording-started-latest.json",
+                     headers={"User-Agent": UA, "Referer": "https://events.q4inc.com/"}, timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"Q4の録画情報を取得できません（HTTP {r.status_code}）。配信前・配信中、または録画が非公開の可能性があります。")
+    info = r.json()
+    key = info.get("masterKey") or ""
+    if not key.endswith(".m3u8"):
+        raise RuntimeError("Q4の録画情報に再生URLがありません。")
+    return {"url": f"{Q4_DVR}/" + "/".join(key.split("/")[3:]),
+            "recording_started_at": info.get("recordingStartedAt", ""),
+            "duration_seconds": info.get("playlistDuration")}
+
+
+def q4_replay_audio_get(media_url, out_path):
+    """ffmpeg reads the replay HLS sequentially (about 1/4 of the call length); explain DVR-side failures."""
+    try:
+        return ffmpeg_get(media_url, out_path)
+    except Exception as exc:
+        raise RuntimeError("Q4の録画サーバーから音声を取得できませんでした。録画サーバーが一時的にエラーを返すことがあるため、"
+                           "時間をおいて再実行してください。\n" + str(exc)[-600:]) from exc
+
+
+def playable_hls(candidate, referer):
+    """True when an m3u8 is an audio/video playlist (variants or media segments), not WebVTT captions."""
+    try:
+        r = requests.get(candidate, headers={"User-Agent": UA, "Referer": referer}, timeout=10)
+    except requests.RequestException:
+        return False
+    if r.status_code >= 400 or "#EXTM3U" not in r.text[:200]:
+        return False
+    body = r.text
+    if "#EXT-X-STREAM-INF" in body:
+        return True
+    segments = [x for x in body.splitlines() if x.strip() and not x.startswith("#")]
+    return bool(segments) and not all(".vtt" in x.lower() or ".webvtt" in x.lower() for x in segments)
+
+
+def media_for_caption_url(caption_url, page_url=""):
+    """Never transcribe captions: find the real audio/video for a subtitles/captions m3u8.
+
+    1. The Q4 event page the URL came from (bookmarklet passes it) → Q4 replay.
+    2. Sibling and parent playlists next to the captions file (master/playlist/index…)."""
+    meeting = q4_meeting_id(page_url)
+    if meeting:
+        return q4_event_media(meeting)
+    parsed = urlparse(caption_url)
+    parts = parsed.path.split("/")
+    names = ("master.m3u8", "playlist.m3u8", "index.m3u8", "main.m3u8", "video.m3u8", "audio.m3u8", "stream.m3u8")
+    for up in range(0, 3):
+        base = "/".join(parts[:len(parts) - 1 - up])
+        if not base:
+            break
+        for name in names:
+            candidate = parsed._replace(path=f"{base}/{name}").geturl()
+            if candidate != caption_url and playable_hls(candidate, page_url or caption_url):
+                return {"url": candidate, "recording_started_at": "", "duration_seconds": None}
+    raise RuntimeError("字幕ファイル（subtitles.m3u8）は文字起こしに使いません。対応する音声・動画が見つからなかったため、"
+                       "Q4のイベントページのURL（https://events.q4inc.com/attendee/番号）をそのまま貼ってください。")
 
 
 def caption_m3u8_to_text(url):
@@ -1224,9 +1301,9 @@ if is_youtube(url):
     if not youtube_direct_ok():
         from urllib.parse import urlencode
         try:
-            mac_app = str(st.secrets.get("MAC_APP_URL", "") or "http://localhost:8501")
+            mac_app = str(st.secrets.get("MAC_APP_URL", "") or "http://127.0.0.1:8501")
         except Exception:
-            mac_app = "http://localhost:8501"
+            mac_app = "http://127.0.0.1:8501"
         signature = autostart_signature(url)
         if signature:
             st.link_button("🖥️ Macで自動処理する（文字起こし → 日本語訳 → Drive保存 → ノート追記）",
@@ -1438,6 +1515,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
             audio = td / "webcast.mp3"
             direct_caption_text = None
             translation_doc_url = ""
+            q4_media = {}
             source_kind = kind(url)
 
             if uploaded_media is not None:
@@ -1452,10 +1530,20 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                 status.info("Q4録画リンクを解析中…（リダイレクト・動画形式を自動判定）")
                 audio = q4_recording_audio_get(url, audio)
                 source = "Q4 recording link"
+            elif q4_meeting_id(url):
+                status.info("Q4のイベントページを検出。録画（音声）の場所を取得中…")
+                q4_media = q4_event_media(q4_meeting_id(url))
+                st.caption(f"録画: {q4_media['url']}")
+                minutes = round((q4_media.get("duration_seconds") or 0) / 60)
+                status.info(f"Q4の録画（約{minutes}分）から音声取得中…録画の長さの4分の1程度の時間がかかります。")
+                audio = q4_replay_audio_get(q4_media["url"], audio)
+                source = "Q4 event replay"
             elif is_caption_m3u8(url):
-                status.info("字幕M3U8を検出。音声ではなく既存WebVTT字幕を直接取得中…")
-                direct_caption_text = caption_m3u8_to_text(url)
-                source = "Q4/HLS subtitles"
+                status.info("字幕ファイルを検出。字幕は使わず、対応する音声・動画を探しています…")
+                q4_media = media_for_caption_url(url, st.session_state.get("prefill_src", ""))
+                st.caption(f"音声・動画: {q4_media['url']}")
+                audio = q4_replay_audio_get(q4_media["url"], audio)
+                source = "Captions URL → " + ("Q4 event replay" if q4_media["recording_started_at"] else "HLS")
             elif is_youtube(url):
                 status.info("YouTubeから音声取得中…")
                 audio = yt_dlp_audio_get(url, audio)
@@ -1550,6 +1638,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                 hints = "\n".join(x for x in [
                     f"URL: {url}", f"Page title: {st.session_state.get('prefill_title', '')}",
                     f"Webcast page: {st.session_state.get('prefill_src', '')}",
+                    f"Recording started (UTC): {q4_media.get('recording_started_at', '')}",
                     f"YouTube title: {youtube_meta.get('title', '')} / channel: {youtube_meta.get('channel', '')}"
                     if youtube_meta.get("title") else "YouTube title: ",
                     f"Media Last-Modified: {media_last_modified(url) if url.strip() and not is_youtube(url) else ''}",

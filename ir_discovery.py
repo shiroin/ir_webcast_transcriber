@@ -110,14 +110,18 @@ def bookmarklet(app_url):
     js = (
         "(()=>{const A=" + repr(app + "/") + ";"
         "const isM=u=>/\\.(m3u8|mp3|m4a|aac|mp4)(\\?|$)/i.test(u);"
-        "const isCap=u=>/caption|subtitle/i.test(u);"
+        "const isCap=u=>/caption|subtitle/i.test(u.split('?')[0]);"
+        # Q4 event pages: the app resolves the replay from the page URL itself, so send it as is.
+        "const q4=location.hostname==='events.q4inc.com'&&/\\/attendee\\/\\d+/.test(location.pathname);"
         "let u=performance.getEntriesByType('resource').map(e=>e.name)"
         ".concat([...document.querySelectorAll('video,audio,source')].map(e=>e.currentSrc||e.src||''))"
         ".filter(isM);u=[...new Set(u)];"
-        "if(!u.length){alert('音声・動画URLが見つかりません。プレイヤーで再生を開始してから再度クリックしてください。"
+        # Captions (subtitles.m3u8) are never sent as the media.
+        "const real=u.filter(x=>!isCap(x));"
+        "if(!q4&&!real.length&&!u.length){alert('音声・動画URLが見つかりません。プレイヤーで再生を開始してから再度クリックしてください。"
         "プレイヤーが別ドメインの枠内にある場合は、その枠を新しいタブで開いてから実行してください。');return}"
-        "const p=u.find(x=>/\\.m3u8/i.test(x)&&!isCap(x)&&!/chunk|segment|\\/seg/i.test(x))"
-        "||u.find(x=>/\\.(mp3|m4a|aac)/i.test(x))||u.find(x=>!isCap(x))||u[0];"
+        "const p=q4||!real.length?location.href:(real.find(x=>/\\.m3u8/i.test(x)&&!/chunk|segment|\\/seg/i.test(x))"
+        "||real.find(x=>/\\.(mp3|m4a|aac)/i.test(x))||real[0]);"
         "window.open(A+'?media='+encodeURIComponent(p)+'&src='+encodeURIComponent(location.href)"
         "+'&title='+encodeURIComponent(document.title.slice(0,200)),'_blank')})()"
     )

@@ -62,7 +62,7 @@ cat > "$PLIST" <<PLISTEOF
     <string>$VENV/bin/python</string>
     <string>-m</string><string>streamlit</string><string>run</string><string>app.py</string>
     <string>--server.port</string><string>8501</string>
-    <string>--server.address</string><string>localhost</string>
+    <string>--server.address</string><string>127.0.0.1</string>
     <string>--server.headless</string><string>true</string>
     <string>--browser.gatherUsageStats</string><string>false</string>
   </array>
