@@ -797,10 +797,28 @@ def is_irwebcasting(url):
     return "irwebcasting.com" in urlparse(url).netloc.lower()
 
 
+def fetch_html(page_url, limit=5_000_000, timeout=20):
+    """GET a page only if it is HTML/text, reading at most `limit` bytes.
+
+    A media URL (e.g. a 900MB MP4) must never be pulled into memory just to look for metadata;
+    that exhausted Streamlit Cloud's RAM and restarted the app."""
+    with requests.get(page_url, headers={"User-Agent": UA}, timeout=timeout, stream=True) as r:
+        r.raise_for_status()
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if ctype and not any(t in ctype for t in ("html", "xml", "text", "json", "javascript", "mpegurl")):
+            raise ValueError(f"HTMLではありません: {ctype}")
+        data = b""
+        for block in r.iter_content(256 * 1024):
+            data += block
+            if len(data) > limit:
+                raise ValueError("ページが大きすぎます")
+        r._content = data
+        return r
+
+
 def extract_irwebcasting_metadata(page_url):
     """Best-effort extraction of company / period / event date from IR Webcasting HTML."""
-    r = requests.get(page_url, headers={"User-Agent": UA}, timeout=25)
-    r.raise_for_status()
+    r = fetch_html(page_url, timeout=25)
     soup = BeautifulSoup(r.text, "html.parser")
     text = "\n".join(x.strip() for x in soup.stripped_strings if x.strip())
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
@@ -905,8 +923,7 @@ def is_smartvision_url(url):
 def extract_generic_ir_metadata(page_url):
     """一般的な日本企業IR動画ページから企業名・決算期をbest-effort抽出。"""
     try:
-        r = requests.get(page_url, headers={"User-Agent": UA}, timeout=20)
-        r.raise_for_status()
+        r = fetch_html(page_url)
     except Exception:
         return {"company": "", "period": "", "date": ""}
     soup = BeautifulSoup(r.text, "html.parser")
@@ -945,12 +962,23 @@ def discover_nested_player_media(page_url, max_depth=2):
         if current in seen: continue
         seen.add(current)
         try:
-            rr = session.get(current, headers={"Referer": referer}, timeout=15)
-            if rr.status_code >= 400 or len(rr.content) > 6_000_000:
-                continue
+            # Stream with a cap: an extensionless link may be a large video, which must not land in RAM.
+            with session.get(current, headers={"Referer": referer}, timeout=15, stream=True) as rr:
+                ctype=(rr.headers.get("content-type") or "").lower()
+                if rr.status_code >= 400 or ctype.startswith(("video/", "audio/")):
+                    if ctype.startswith(("video/", "audio/")) and rr.status_code < 400:
+                        media.append(current)
+                    continue
+                body = b""
+                for block in rr.iter_content(256 * 1024):
+                    body += block
+                    if len(body) > 6_000_000:
+                        break
+                if len(body) > 6_000_000:
+                    continue
+                rr._content = body
         except requests.RequestException:
             continue
-        ctype=(rr.headers.get("content-type") or "").lower()
         if "mpegurl" in ctype or rr.text.lstrip().startswith("#EXTM3U"):
             media.append(current); continue
         text=rr.text.replace("\\/", "/")
@@ -1330,6 +1358,8 @@ elif url.strip() and is_irwebcasting(url.strip()):
         st.caption("IR Webcastingを検出：企業名・決算期・説明会日を自動取得します。")
     except Exception as e:
         st.caption(f"IR Webcastingのタグ自動取得に失敗しました（手入力は可能です）: {e}")
+elif url.strip() and (kind(url) or q4_meeting_id(url) or is_q4_recording_link(url)):
+    pass  # Direct media / Q4 replay: no HTML page to read (and never download the media here).
 elif url.strip():
     # SmartVisionを含む一般IR動画ページでもタグをbest-effort取得。
     try:
@@ -1376,8 +1406,11 @@ with c1:
         help="高精度なら gpt-4o-transcribe、軽量・低コスト寄りなら mini。",
     )
 with c2:
+    # Japanese companies and /ja/ URLs default to Japanese; everything else to English.
+    japanese_call = ((selected or {}).get("country") == "日本"
+                     or re.search(r"(?:^|[/_.-])ja(?:$|[/_.-])", urlparse(url).path.lower()) is not None)
     language = st.selectbox(
-        "言語", ["en", "zh", "ko", "ja", "auto"], index=0,
+        "言語", ["en", "zh", "ko", "ja", "auto"], index=3 if japanese_call else 0,
         format_func=lambda x: {"en":"英語","zh":"中国語（標準中国語）","ko":"韓国語","ja":"日本語","auto":"自動判定"}[x],
     )
 
@@ -1686,7 +1719,12 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                 status.info("日本語訳を作成中…")
                 # Keep metadata deterministic: copy field values from the source verbatim.
                 # Translate only the transcript body so the model cannot omit or alter tags.
-                translated_body = translate_to_japanese(text, api_key, usage_stats=translation_usage)
+                if language == "ja":
+                    # Already Japanese: keep the transcript as the Japanese text instead of paying to "translate" it.
+                    translated_body = text
+                    st.caption("日本語の説明会のため、翻訳APIは使わず文字起こしをそのまま日本語版として保存します。")
+                else:
+                    translated_body = translate_to_japanese(text, api_key, usage_stats=translation_usage)
                 japanese_metadata = "# IR Webcast メタデータ\n" + "\n".join(
                     "- " + line.replace("Transcription model:", "文字起こしモデル:")
                                .replace("Transcript source:", "原文取得元:")
