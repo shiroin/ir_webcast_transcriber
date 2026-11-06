@@ -20,6 +20,7 @@ COLUMNS = {
     "フォルダ": "root_folder",
     "Quarterly_Analysis": "transcript_folder",
     "05_決算分析ノート": "note_url",
+    "05更新": "note_updated",
 }
 CACHE_SECONDS = 600
 
@@ -101,14 +102,57 @@ def guess_company(companies, *texts):
     return best
 
 
-def write_note_url(item, url):
-    """Record a newly created analysis note back into the 05_決算分析ノート column."""
+def _column_position(key):
     positions = st.session_state.get("company_registry_cache", {}).get("positions") or {}
-    if "note_url" not in positions:
+    if key not in positions:
         load_companies(force=True)
         positions = st.session_state["company_registry_cache"]["positions"]
+    if key not in positions:
+        header = next(name for name, k in COLUMNS.items() if k == key)
+        raise RuntimeError(f"企業マスターに「{header}」列が見つかりません。")
+    return positions[key]
+
+
+def _write_cell(item, key, value, input_option="RAW"):
     sheet_id, sheet_name = sheet_location()
-    cell = f"'{sheet_name}'!{column_letter(positions['note_url'])}{item['row']}"
+    cell = f"'{sheet_name}'!{column_letter(_column_position(key))}{item['row']}"
     google_api("PUT", f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{quote(cell, safe='')}",
-               params={"valueInputOption": "RAW"}, json={"range": cell, "values": [[url]]})
-    item["note_url"] = url
+               params={"valueInputOption": input_option}, json={"range": cell, "values": [[value]]})
+    item[key] = value
+
+
+def write_note_url(item, url):
+    """Record a newly created analysis note back into the 05_決算分析ノート column."""
+    _write_cell(item, "note_url", url)
+
+
+def _write_dates(updates):
+    """Batch-write 05更新 dates as real dates formatted yyyy-mm-dd."""
+    sheet_id, sheet_name = sheet_location()
+    col = _column_position("note_updated")
+    letter = column_letter(col)
+    google_api("POST", f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values:batchUpdate",
+               json={"valueInputOption": "USER_ENTERED",
+                     "data": [{"range": f"'{sheet_name}'!{letter}{item['row']}", "values": [[day]]}
+                              for item, day in updates]})
+    meta = google_api("GET", f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}",
+                      params={"fields": "sheets.properties(sheetId,title)"})
+    tab = next(x["properties"]["sheetId"] for x in meta.get("sheets", []) if x["properties"]["title"] == sheet_name)
+    google_api("POST", f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}:batchUpdate", json={"requests": [{
+        "repeatCell": {"range": {"sheetId": tab, "startRowIndex": item["row"] - 1, "endRowIndex": item["row"],
+                                 "startColumnIndex": col, "endColumnIndex": col + 1},
+                       "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "yyyy-mm-dd"}}},
+                       "fields": "userEnteredFormat.numberFormat"}} for item, _ in updates]})
+    for item, day in updates:
+        item["note_updated"] = day
+
+
+def write_note_updated(item, day=None):
+    """Record today's date (JST) in 05更新 after a quarter was added to the analysis note.
+
+    Entered as a real date shown as yyyy-mm-dd, like the neighbouring Financial更新日 column."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    day = day or datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d")
+    _write_dates([(item, day)])
+    return day

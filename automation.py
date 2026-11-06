@@ -81,4 +81,9 @@ def run_analysis_step(job, api_key):
         st.success(f"05_決算分析ノートに {job['period']} を追記しました（{analysis['char_count']:,}字・"
                    f"論点{len(analysis['sections'])}個、入力{usage.get('input_tokens', 0):,}／"
                    f"出力{usage.get('output_tokens', 0):,}トークン）。")
+        try:
+            day = company_registry.write_note_updated(item)
+            st.caption(f"企業マスターの「05更新」列に {day} を記録しました。")
+        except Exception as exc:
+            st.warning(f"企業マスターの「05更新」列への日付の記録に失敗しました（手動で記入してください）: {exc}")
     st.markdown(f"[05_決算分析ノートを開く]({doc_url})")
