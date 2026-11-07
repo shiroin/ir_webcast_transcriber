@@ -1,0 +1,10 @@
+[server]
+headless = true
+enableCORS = true
+enableXsrfProtection = true
+# 決算説明会の動画（1時間・1080pで350MB前後）をアップロードできるように、既定の200MBから1GBへ。
+# アップロードしたファイルはディスクに少しずつ書き出してから音声に変換する（transcode_uploaded_audio）。
+maxUploadSize = 1024
+
+[browser]
+gatherUsageStats = false
