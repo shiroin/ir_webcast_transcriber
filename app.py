@@ -343,6 +343,54 @@ def q4_event_media(meeting_id):
             "duration_seconds": info.get("playlistDuration")}
 
 
+def brightcove_player_url(page_url):
+    """Brightcove player URL for a page that embeds <video data-video-id data-account> (e.g. group.softbank).
+
+    The page HTML has no .m3u8/.mp4; the player builds them, so build the player URL and let yt-dlp resolve it."""
+    parsed = urlparse(page_url)
+    if (parsed.hostname or "").endswith("players.brightcove.net"):
+        return page_url
+    try:
+        html = fetch_html(page_url).text
+    except Exception:
+        return ""
+    m = re.search(r"players\.brightcove\.net/(\d+)/([A-Za-z0-9_-]+)_([A-Za-z0-9_-]+)/index\.html\?[^\"'<>]*?videoId=(\d+)", html)
+    if m:
+        return f"https://players.brightcove.net/{m.group(1)}/{m.group(2)}_{m.group(3)}/index.html?videoId={m.group(4)}"
+    for tag in re.findall(r"<video[^>]*data-video-id=[^>]*>", html):
+        attr = lambda name: (re.search(name + r'="([^"]+)"', tag) or [None, ""])[1]
+        if attr("data-video-id").isdigit() and attr("data-account").isdigit():
+            return (f"https://players.brightcove.net/{attr('data-account')}/{attr('data-player') or 'default'}_"
+                    f"{attr('data-embed') or 'default'}/index.html?videoId={attr('data-video-id')}")
+    return ""
+
+
+def yt_dlp_generic_audio_get(url, out_path, referer=None):
+    """Audio only via yt-dlp for embedded players (Brightcove and others yt-dlp knows). Returns (path, title)."""
+    template = str(out_path.with_suffix(".%(ext)s"))
+    cmd = [sys.executable, "-m", "yt_dlp", "--no-config", "--no-playlist", "--no-progress",
+           "--socket-timeout", "25", "--retries", "3", "--fragment-retries", "5",
+           "--concurrent-fragments", "4", "--user-agent", UA]
+    if referer:
+        cmd += ["--referer", referer]
+    # Lowest-bitrate audio track is plenty for speech; the transcription chunks are 32 kbps anyway.
+    cmd += ["-f", "ba[abr<=100]/ba/b", "-x", "--audio-format", "mp3", "--audio-quality", "64K",
+            "--print", "before_dl:%(title)s", "--no-simulate", "-o", template, url]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("yt-dlpでの音声取得が30分でタイムアウトしました")
+    if p.returncode or not out_path.exists() or out_path.stat().st_size == 0:
+        out_path.unlink(missing_ok=True)
+        raise RuntimeError("yt-dlpで音声を取得できませんでした: " + (p.stderr or p.stdout)[-800:])
+    title = next((x.strip() for x in p.stdout.splitlines() if x.strip()), "")
+    return out_path, title
+
+
+NOT_PLAYERS = ("googletagmanager.com", "doubleclick.net", "google-analytics.com", "facebook.com",
+               "twitter.com", "linkedin.com", "addtoany.com", "recaptcha", "cookie")
+
+
 def q4_replay_audio_get(media_url, out_path):
     """ffmpeg reads the replay HLS sequentially (about 1/4 of the call length); explain DVR-side failures."""
     try:
@@ -1549,6 +1597,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
             direct_caption_text = None
             translation_doc_url = ""
             q4_media = {}
+            media_title = ""
             source_kind = kind(url)
 
             if uploaded_media is not None:
@@ -1613,27 +1662,35 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                 source = source_kind.upper()
             else:
                 status.info("IR Webcasting / SmartVision / IRページ内の音声URLを探索中…")
-                nested_candidates, player_pages = discover_nested_player_media(url, max_depth=2)
-                candidates = nested_candidates or discover_media(url)
-                if not candidates and player_pages and yt_dlp_available():
-                    # プレイヤーHTML自体をyt-dlpが解決できる実装へのフォールバック。
+                candidates = []
+                brightcove = brightcove_player_url(url)
+                if brightcove and yt_dlp_available():
+                    status.info("Brightcoveの動画を検出。音声のみを取得中…")
+                    audio, media_title = yt_dlp_generic_audio_get(brightcove, audio, referer=url)
+                    source = "Brightcove"
+                else:
+                    nested_candidates, player_pages = discover_nested_player_media(url, max_depth=2)
+                    candidates = nested_candidates or discover_media(url)
+                if not brightcove and not candidates and yt_dlp_available():
+                    # yt-dlp knows many embedded players: try the page itself, then real player iframes.
+                    players = [p for p in player_pages if not any(x in p.lower() for x in NOT_PLAYERS)]
                     last_player_error = None
-                    for player_url in player_pages[:5]:
+                    for target in [url] + players[:5]:
                         try:
-                            status.info("SmartVision系プレイヤーをyt-dlpで解析中…")
-                            audio = yt_dlp_audio_get(player_url, audio)
-                            source = "SmartVision/iframe → yt-dlp"
+                            status.info("埋め込みプレイヤーをyt-dlpで解析中…")
+                            audio, media_title = yt_dlp_generic_audio_get(target, audio, referer=url)
+                            source = "埋め込みプレイヤー → yt-dlp"
                             break
                         except Exception as e:
                             last_player_error = e
                     else:
-                        st.error("SmartVision/IRページからメディアを自動検出できませんでした。")
+                        st.error("IRページから音声・動画を自動検出できませんでした。")
                         if last_player_error:
-                            st.code(str(last_player_error))
-                        st.info("Cookie・署名URL・DRM型の場合は、DevToolsのNetworkから m3u8 / mp3 / mp4 を取得して貼ってください。")
+                            st.code(str(last_player_error)[-1200:])
+                        st.info("プレイヤーで再生を開始してから、ブックマークレットで音声URLを取得してください。"
+                                "サイトがこのサーバーからのアクセスを拒否している場合は、Mac版で処理してください。")
                         st.stop()
-                    candidates = []
-                elif not candidates:
+                elif not brightcove and not candidates:
                     st.error("自動検出できませんでした。JavaScript / Cookie / 認証型の可能性があります。")
                     st.info("この場合だけDevToolsのNetworkから m3u8 / mp3 / mp4 / ts を取得して貼ってください。")
                     st.stop()
@@ -1672,6 +1729,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                     f"URL: {url}", f"Page title: {st.session_state.get('prefill_title', '')}",
                     f"Webcast page: {st.session_state.get('prefill_src', '')}",
                     f"Recording started (UTC): {q4_media.get('recording_started_at', '')}",
+                    f"Video title: {media_title}",
                     f"YouTube title: {youtube_meta.get('title', '')} / channel: {youtube_meta.get('channel', '')}"
                     if youtube_meta.get("title") else "YouTube title: ",
                     f"Media Last-Modified: {media_last_modified(url) if url.strip() and not is_youtube(url) else ''}",
