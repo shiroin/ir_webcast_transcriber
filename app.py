@@ -510,6 +510,24 @@ def ffmpeg_available():
     return shutil.which("ffmpeg") is not None
 
 
+_HLS_PICKY_FLAG = None
+
+
+def ffmpeg_hls_args():
+    """Newer ffmpeg rejects HLS segments with unusual extensions (Brightcove uses .m4f).
+
+    Disable that check only where this ffmpeg has the option; older builds neither have nor need it."""
+    global _HLS_PICKY_FLAG
+    if _HLS_PICKY_FLAG is None:
+        try:
+            help_text = subprocess.run(["ffmpeg", "-hide_banner", "-h", "demuxer=hls"], capture_output=True,
+                                       text=True, timeout=15).stdout
+        except Exception:
+            help_text = ""
+        _HLS_PICKY_FLAG = ["-extension_picky", "0"] if "extension_picky" in help_text else []
+    return _HLS_PICKY_FLAG
+
+
 def ffmpeg_get(url, out_path):
     """Stream audio from remote media; never load a large MP4 into Python RAM.
 
@@ -527,9 +545,11 @@ def ffmpeg_get(url, out_path):
         "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
         "-c:a", "libmp3lame", "-b:a", "32k", str(out_path),
     ]
+    is_hls = parsed.path.lower().endswith(".m3u8")
     direct = ffmpeg_base + [
         "-rw_timeout", "30000000", "-user_agent", UA,
         "-headers", f"Referer: {parsed.scheme}://{parsed.netloc}/\r\n",
+        *(ffmpeg_hls_args() if is_hls else []),
         "-i", url,
     ] + encode_args
     try:
@@ -539,8 +559,21 @@ def ffmpeg_get(url, out_path):
             return out_path
         raise RuntimeError("変換後の音声が空です")
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError) as exc:
-        direct_error = str(exc)[-600:]
+        # Show ffmpeg's own message, not the command line.
+        stderr = getattr(exc, "stderr", None)
+        stderr = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else (stderr or "")
+        direct_error = (stderr.strip() or str(exc))[-600:]
         out_path.unlink(missing_ok=True)
+
+    if is_hls:
+        # A playlist is text: downloading it "as a video" can never work. yt-dlp's HLS downloader
+        # handles fMP4 renditions and separate audio groups that ffmpeg sometimes cannot.
+        try:
+            path, _ = yt_dlp_generic_audio_get(url, out_path, referer=f"{parsed.scheme}://{parsed.netloc}/")
+            return path
+        except Exception as exc:
+            raise RuntimeError(f"HLS（m3u8）から音声を取得できませんでした。ffmpeg: {direct_error}; yt-dlp: {str(exc)[-600:]}"
+                               "\nURLに有効期限付きのトークンが含まれる場合は、ページを開き直して新しいURLを取得してください。") from exc
 
     # Fallback: stream to disk in small blocks, not requests.get(...).content.
     # Keep bounded to protect Streamlit Cloud's ephemeral disk.
