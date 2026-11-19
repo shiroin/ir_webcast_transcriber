@@ -41,8 +41,10 @@ if "media" in st.query_params:
     import hmac as _hmac
     _media = str(st.query_params.get("media", ""))
     _sig = autostart_signature(_media)
-    st.session_state["autostart_requested"] = bool(
-        _sig and _hmac.compare_digest(_sig, str(st.query_params.get("auto", ""))))
+    _auto = str(st.query_params.get("auto", ""))
+    # Accept the Cloud→Mac button (signed per URL) or the user's own bookmarklet (fixed token shown only in this app).
+    st.session_state["autostart_requested"] = bool(_auto) and any(
+        sig and _hmac.compare_digest(sig, _auto) for sig in (_sig, autostart_signature("bookmarklet:v1")))
     st.session_state["webcast_url"] = _media
     st.session_state["prefill_src"] = str(st.query_params.get("src", ""))[:500]
     st.session_state["prefill_title"] = str(st.query_params.get("title", ""))[:200]
@@ -332,12 +334,19 @@ def q4_event_media(meeting_id):
     the DVR host plus masterKey without its first three segments (ivs/v1/<account>)."""
     r = requests.get(f"{Q4_DVR}/{meeting_id}/recording-started-latest.json",
                      headers={"User-Agent": UA, "Referer": "https://events.q4inc.com/"}, timeout=20)
+    expired = ("Q4の配信直後用の録画（DVR）を取得できません。配信から時間が経ち削除された可能性があります。"
+               "Q4のページを開いてリプレイを再生し（視聴登録を求められたら登録）、ブックマークレットを押してください。"
+               "再生中の録画URLが送られ、自動で処理されます。")
+    # The DVR copy exists only for a while after the live event; afterwards it answers 404 or a 200 with an error body.
     if r.status_code != 200:
-        raise RuntimeError(f"Q4の録画情報を取得できません（HTTP {r.status_code}）。配信前・配信中、または録画が非公開の可能性があります。")
-    info = r.json()
+        raise RuntimeError(f"{expired}（HTTP {r.status_code}）")
+    try:
+        info = r.json()
+    except ValueError:
+        raise RuntimeError(expired)
     key = info.get("masterKey") or ""
     if not key.endswith(".m3u8"):
-        raise RuntimeError("Q4の録画情報に再生URLがありません。")
+        raise RuntimeError(expired)
     return {"url": f"{Q4_DVR}/" + "/".join(key.split("/")[3:]),
             "recording_started_at": info.get("recordingStartedAt", ""),
             "duration_seconds": info.get("playlistDuration")}
@@ -421,8 +430,12 @@ def media_for_caption_url(caption_url, page_url=""):
     1. The Q4 event page the URL came from (bookmarklet passes it) → Q4 replay.
     2. Sibling and parent playlists next to the captions file (master/playlist/index…)."""
     meeting = q4_meeting_id(page_url)
+    q4_error = None
     if meeting:
-        return q4_event_media(meeting)
+        try:
+            return q4_event_media(meeting)
+        except Exception as exc:
+            q4_error = exc
     parsed = urlparse(caption_url)
     parts = parsed.path.split("/")
     names = ("master.m3u8", "playlist.m3u8", "index.m3u8", "main.m3u8", "video.m3u8", "audio.m3u8", "stream.m3u8")
@@ -434,8 +447,9 @@ def media_for_caption_url(caption_url, page_url=""):
             candidate = parsed._replace(path=f"{base}/{name}").geturl()
             if candidate != caption_url and playable_hls(candidate, page_url or caption_url):
                 return {"url": candidate, "recording_started_at": "", "duration_seconds": None}
-    raise RuntimeError("字幕ファイル（subtitles.m3u8）は文字起こしに使いません。対応する音声・動画が見つからなかったため、"
-                       "Q4のイベントページのURL（https://events.q4inc.com/attendee/番号）をそのまま貼ってください。")
+    raise RuntimeError("字幕ファイル（subtitles.m3u8）は文字起こしに使いません。対応する音声・動画が見つかりませんでした。"
+                       + (str(q4_error) if q4_error else
+                          "Q4のイベントページのURL（https://events.q4inc.com/attendee/番号）をそのまま貼ってください。"))
 
 
 def caption_m3u8_to_text(url):
@@ -1392,9 +1406,12 @@ if selected:
 with st.expander("🔖 ブックマークレット：再生中のWebcastから音声URLを取得してこのアプリを開く"):
     st.markdown("1. ブラウザで新しいブックマークを作り、URL欄に下のコードを丸ごと貼り付けます（初回のみ）。\n"
                 "2. 決算説明会のWebcastページを開いて**再生を開始**し、そのブックマークをクリックします。\n"
-                "3. 音声URLが入力された状態でこのアプリが開きます。ページタイトルから企業も自動選択されます。")
+                "3. このアプリが開き、ページタイトルから企業を判定して、文字起こし → 日本語訳 → Drive保存 → "
+                "05_決算分析ノート追記まで**自動で**進みます。企業を判定できない場合だけ、企業を選んで「文字起こし開始」を押します。\n\n"
+                "※ コードには、このアプリ専用の合言葉が入っています（他人に共有しないでください）。"
+                "古い版のブックマークを使っている場合は、URL欄をこのコードに貼り替えてください。")
     from ir_discovery import bookmarklet
-    st.code(bookmarklet(app_url()), language="text")
+    st.code(bookmarklet(app_url(), autostart_signature("bookmarklet:v1")), language="text")
     st.caption("NVIDIAやBroadcomのようにIRサイトがサーバーからのアクセスを拒否する場合でも、"
                "ご自身のブラウザ内で動くため取得できます。プレイヤーが別ドメインの枠内にある場合は、"
                "その枠を新しいタブで開いてから実行してください。")

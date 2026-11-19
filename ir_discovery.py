@@ -104,25 +104,28 @@ def find_webcast_candidates(page_url, limit=15):
     return found[:limit]
 
 
-def bookmarklet(app_url):
-    """Bookmarklet: collect media URLs the open player loaded, then open this app pre-filled."""
+def bookmarklet(app_url, auto_token=""):
+    """Bookmarklet: send the media the open player is actually playing to this app, which then runs everything.
+
+    auto_token (shown only inside the app) lets the app start processing automatically on open."""
     app = app_url.rstrip("/")
     js = (
-        "(()=>{const A=" + repr(app + "/") + ";"
+        "(()=>{const A=" + repr(app + "/") + ";const T=" + repr(auto_token) + ";"
         "const isM=u=>/\\.(m3u8|mp3|m4a|aac|mp4)(\\?|$)/i.test(u);"
         "const isCap=u=>/caption|subtitle/i.test(u.split('?')[0]);"
-        # Q4 event pages: the app resolves the replay from the page URL itself, so send it as is.
         "const q4=location.hostname==='events.q4inc.com'&&/\\/attendee\\/\\d+/.test(location.pathname);"
-        "let u=performance.getEntriesByType('resource').map(e=>e.name)"
-        ".concat([...document.querySelectorAll('video,audio,source')].map(e=>e.currentSrc||e.src||''))"
-        ".filter(isM);u=[...new Set(u)];"
+        # What the <video>/<audio> element plays counts even without an extension (Q4 replay links have none).
+        "const el=[...document.querySelectorAll('video,audio,source')].map(e=>e.currentSrc||e.src||'')"
+        ".filter(x=>/^https?:/.test(x));"
+        "let u=performance.getEntriesByType('resource').map(e=>e.name).filter(isM).concat(el);u=[...new Set(u)];"
         # Captions (subtitles.m3u8) are never sent as the media.
         "const real=u.filter(x=>!isCap(x));"
-        "if(!q4&&!real.length&&!u.length){alert('音声・動画URLが見つかりません。プレイヤーで再生を開始してから再度クリックしてください。"
+        "if(!q4&&!real.length){alert('音声・動画URLが見つかりません。プレイヤーで再生を開始してから再度クリックしてください。"
         "プレイヤーが別ドメインの枠内にある場合は、その枠を新しいタブで開いてから実行してください。');return}"
-        "const p=q4||!real.length?location.href:(real.find(x=>/\\.m3u8/i.test(x)&&!/chunk|segment|\\/seg/i.test(x))"
-        "||real.find(x=>/\\.(mp3|m4a|aac)/i.test(x))||real[0]);"
+        # Prefer what is actually playing; a Q4 page URL is only the fallback (its DVR copy expires).
+        "const p=!real.length?location.href:(real.find(x=>/\\.m3u8/i.test(x)&&!/chunk|segment|\\/seg/i.test(x))"
+        "||el.find(x=>!isCap(x))||real.find(x=>/\\.(mp3|m4a|aac)/i.test(x))||real[0]);"
         "window.open(A+'?media='+encodeURIComponent(p)+'&src='+encodeURIComponent(location.href)"
-        "+'&title='+encodeURIComponent(document.title.slice(0,200)),'_blank')})()"
+        "+'&title='+encodeURIComponent(document.title.slice(0,200))+(T?'&auto='+T:''),'_blank')})()"
     )
     return "javascript:" + quote(js, safe="()=>{}[];,.'+|!&*/:?-_$@")
