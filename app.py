@@ -17,28 +17,6 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="IR Webcast Transcriber", page_icon="🎧", layout="centered")
-
-
-def _app_password():
-    try:
-        return str(st.secrets.get("APP_PASSWORD", "") or "")
-    except Exception:
-        return ""
-
-
-def _is_local_desktop():
-    """Mac/Windows版（127.0.0.1 でのみ待ち受け）。Streamlit Cloud は Linux。"""
-    import platform
-    return platform.system() in ("Darwin", "Windows")
-
-
-# Cloud版は APP_PASSWORD 必須。未設定なら OAuth コールバックも含めて一切処理せずに止める
-# （OpenAI の料金と Google Drive への書き込みを第三者に使われないため）。
-if not _app_password() and not _is_local_desktop():
-    st.error("APP_PASSWORD が設定されていないため、アプリを停止しています。")
-    st.info("Streamlit Cloud の「Settings → Secrets」に `APP_PASSWORD = \"...\"` を追加して保存すると起動します。")
-    st.stop()
-
 if "code" in st.query_params or "error" in st.query_params:
     from google_drive_integration import _google_oauth_callback
     _google_oauth_callback()
@@ -67,11 +45,22 @@ if "media" in st.query_params:
     # Accept the Cloud→Mac button (signed per URL) or the user's own bookmarklet (fixed token shown only in this app).
     st.session_state["autostart_requested"] = bool(_auto) and any(
         sig and _hmac.compare_digest(sig, _auto) for sig in (_sig, autostart_signature("bookmarklet:v1")))
+    if st.session_state["autostart_requested"]:
+        # The token proves the request came from the user's own bookmarklet or Mac button,
+        # so skip APP_PASSWORD (the password itself never goes into a URL).
+        st.session_state["app_unlocked"] = True
     st.session_state["webcast_url"] = _media
     st.session_state["prefill_src"] = str(st.query_params.get("src", ""))[:500]
     st.session_state["prefill_title"] = str(st.query_params.get("title", ""))[:200]
     st.session_state["ir_page"] = "🎧 IR Webcast 文字起こし"
     st.query_params.clear()
+
+
+def _app_password():
+    try:
+        return str(st.secrets.get("APP_PASSWORD", "") or "")
+    except Exception:
+        return ""
 
 
 if _app_password() and not st.session_state.get("app_unlocked"):
@@ -365,6 +354,34 @@ def q4_event_media(meeting_id):
     return {"url": f"{Q4_DVR}/" + "/".join(key.split("/")[3:]),
             "recording_started_at": info.get("recordingStartedAt", ""),
             "duration_seconds": info.get("playlistDuration")}
+
+
+SPEAKER_RE = re.compile(r"^(?:[A-Z][A-Za-z.'\-]+(?: [A-Z][A-Za-z.'\-]+){0,4}|OPERATOR|Operator)\s*:")
+
+
+def page_transcript(page_url):
+    """Full call transcript published on the IR page itself (e.g. microsoft.com/investor/events/...).
+
+    Uses the largest text block with many paragraphs and repeated "SPEAKER NAME:" labels. The official text is
+    more accurate than speech recognition and needs no transcription API. Returns text or ""."""
+    try:
+        soup = BeautifulSoup(fetch_html(page_url).text, "html.parser")
+    except Exception:
+        return ""
+    best = ""
+    for block in soup.find_all(["div", "section", "article"]):
+        paragraphs = block.find_all("p")
+        if len(paragraphs) < 60:
+            continue
+        lines = [p.get_text(" ", strip=True) for p in paragraphs]
+        lines = [x for x in lines if x]
+        if "END" in lines:
+            lines = lines[:len(lines) - lines[::-1].index("END")]  # drop page buttons after the closing "END"
+        speakers = sum(1 for x in lines if SPEAKER_RE.match(x))
+        text = "\n\n".join(lines)
+        if speakers >= 5 and len(text) >= 20000 and len(text) > len(best):
+            best = text
+    return best
 
 
 def brightcove_player_url(page_url):
@@ -1728,15 +1745,21 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
             else:
                 status.info("IR Webcasting / SmartVision / IRページ内の音声URLを探索中…")
                 candidates = []
-                brightcove = brightcove_player_url(url)
-                if brightcove and yt_dlp_available():
+                published = page_transcript(url)
+                brightcove = "" if published else brightcove_player_url(url)
+                if published:
+                    # An official transcript on the page beats speech recognition: no audio, no transcription cost.
+                    direct_caption_text = published
+                    source = "IRページ掲載の公式書き起こし"
+                    st.caption(f"IRページに書き起こし全文（{len(published):,}文字）が掲載されているため、音声ではなくこれを原文に使います。")
+                elif brightcove and yt_dlp_available():
                     status.info("Brightcoveの動画を検出。音声のみを取得中…")
                     audio, media_title = yt_dlp_generic_audio_get(brightcove, audio, referer=url)
                     source = "Brightcove"
                 else:
                     nested_candidates, player_pages = discover_nested_player_media(url, max_depth=2)
                     candidates = nested_candidates or discover_media(url)
-                if not brightcove and not candidates and yt_dlp_available():
+                if not published and not brightcove and not candidates and yt_dlp_available():
                     # yt-dlp knows many embedded players: try the page itself, then real player iframes.
                     players = [p for p in player_pages if not any(x in p.lower() for x in NOT_PLAYERS)]
                     last_player_error = None
@@ -1755,7 +1778,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                         st.info("プレイヤーで再生を開始してから、ブックマークレットで音声URLを取得してください。"
                                 "サイトがこのサーバーからのアクセスを拒否している場合は、Mac版で処理してください。")
                         st.stop()
-                elif not brightcove and not candidates:
+                elif not published and not brightcove and not candidates:
                     st.error("自動検出できませんでした。JavaScript / Cookie / 認証型の可能性があります。")
                     st.info("この場合だけDevToolsのNetworkから m3u8 / mp3 / mp4 / ts を取得して貼ってください。")
                     st.stop()
@@ -1776,7 +1799,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
 
             if direct_caption_text is not None:
                 text = direct_caption_text
-                status.info(f"{source}: 既存字幕の取得完了。音声文字起こしAPIは使用していません。")
+                status.info(f"{source}: 原文テキストの取得完了。音声文字起こしAPIは使用していません。")
             else:
                 duration = get_duration_seconds(audio)
                 billed_audio_minutes = max(0.0, duration / 60)
@@ -1816,7 +1839,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
             if earnings_date.strip(): tags.append(f"説明会日: {earnings_date.strip()}")
             if event_type: tags.append(f"種別: {event_type}")
             tags.append(f"URL: {url}")
-            tags.append(f"Transcription model: {api_model}" if direct_caption_text is None else "Transcript source: existing HLS/WebVTT captions")
+            tags.append(f"Transcription model: {api_model}" if direct_caption_text is None else f"Transcript source: {source}")
             metadata = "# IR Webcast Metadata\n" + "\n".join(f"- {x}" for x in tags)
             transcript_with_tags = metadata + "\n\n# Transcript\n" + text
 
@@ -1943,7 +1966,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                 else:
                     st.caption("MP3が25MBを超えるため、Streamlitのメモリ保護のためダウンロード表示を省略しました。")
             elif direct_caption_text is not None:
-                st.caption("このURLは字幕ストリームのためMP3はありません。音声が必要な場合はaudio/video側のm3u8を貼ってください。")
+                st.caption("音声ではなく既存の原文テキストを使ったため、MP3はありません。")
     except Exception as e:
         st.error("処理に失敗しました。")
         st.code(str(e))
