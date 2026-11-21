@@ -26,14 +26,14 @@ v41の「🎧 IR Webcast 文字起こし」画面を、次の1本の流れで動
 - `ir_discovery.py`（新規）：IRページのWebcastリンク探索と、ブックマークレットの生成。
 - `analysis_note.py`（新規）：決算期・説明会日の判定、分析の生成、Googleドキュメントへの追記。
 - `google_drive_integration.py`：`GOOGLE_REFRESH_TOKEN` による自動接続、汎用Google API呼び出し。
-- `app.py`：Webcast画面に企業選択・自動判定・ノート追記を追加。`APP_PASSWORD`（任意）。不具合修正2件（下記）。
+- `app.py`：Webcast画面に企業選択・自動判定・ノート追記を追加。`APP_PASSWORD`（Cloud版では必須。未設定だと起動しない）。不具合修正2件（下記）。
 - `workflow_utils.py` はこのZIPに含まれていません。GitHubにある既存ファイルをそのまま残してください（削除しないこと）。
 
 ## 初回セットアップ（1回だけ）
 
 1. **Google Cloud で API を有効化**：OAuthクライアントがあるプロジェクトで、*Google Docs API* と *Google Sheets API* を有効化（Drive APIは有効化済みのはず）。
 2. **OAuth同意画面を「本番環境（In production）」にする**：「テスト」のままだとリフレッシュトークンが7日で失効します。個人利用なら未審査のままで構いません（ログイン時に警告が出るだけです）。
-3. **アプリを非公開にする**：トークンを保存すると、アプリを開いた人は誰でもあなたのDriveに書き込め、OpenAIの料金も使えてしまいます。Streamlit Community Cloudの *Share* 設定でアプリを非公開にし、閲覧者を自分だけにしてください（Streamlitのログインはブラウザに保持されます）。追加の対策として `APP_PASSWORD` も設定できます。
+3. **アプリを非公開にする**：トークンを保存すると、アプリを開いた人は誰でもあなたのDriveに書き込め、OpenAIの料金も使えてしまいます。Streamlit Community Cloudの *Share* 設定でアプリを非公開にし、閲覧者を自分だけにしてください（Streamlitのログインはブラウザに保持されます）。加えて `APP_PASSWORD` を必ず設定してください（未設定だとCloud版は起動しません）。
 4. デプロイ後、一度だけ「Googleアカウントでログイン」→ 表示される「次回からログイン不要にする」を開き、`GOOGLE_REFRESH_TOKEN = "..."` をコピー。
 5. Streamlit Cloud の Secrets に追記：
 
@@ -45,7 +45,7 @@ GOOGLE_REDIRECT_URI = "https://irwebcasttranscriber-2ytgsid2pfpmajk8qrvqvv.strea
 GOOGLE_OAUTH_STATE_SECRET = "..."
 GOOGLE_REFRESH_TOKEN = "..."          # 手順4で取得
 APP_URL = "https://irwebcasttranscriber-2ytgsid2pfpmajk8qrvqvv.streamlit.app"   # ブックマークレット用
-# APP_PASSWORD = "..."                # 任意。設定するとセッションごとにパスワードを確認
+APP_PASSWORD = "..."                  # 必須（Cloud版）。未設定だと起動しない。セッションごとにパスワードを確認
 # COMPANY_SHEET_ID / COMPANY_SHEET_NAME  # 企業マスターを変える場合のみ
 ```
 
