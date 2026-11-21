@@ -17,6 +17,28 @@ import streamlit as st
 from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="IR Webcast Transcriber", page_icon="🎧", layout="centered")
+
+
+def _app_password():
+    try:
+        return str(st.secrets.get("APP_PASSWORD", "") or "")
+    except Exception:
+        return ""
+
+
+def _is_local_desktop():
+    """Mac/Windows版（127.0.0.1 でのみ待ち受け）。Streamlit Cloud は Linux。"""
+    import platform
+    return platform.system() in ("Darwin", "Windows")
+
+
+# Cloud版は APP_PASSWORD 必須。未設定なら OAuth コールバックも含めて一切処理せずに止める
+# （OpenAI の料金と Google Drive への書き込みを第三者に使われないため）。
+if not _app_password() and not _is_local_desktop():
+    st.error("APP_PASSWORD が設定されていないため、アプリを停止しています。")
+    st.info("Streamlit Cloud の「Settings → Secrets」に `APP_PASSWORD = \"...\"` を追加して保存すると起動します。")
+    st.stop()
+
 if "code" in st.query_params or "error" in st.query_params:
     from google_drive_integration import _google_oauth_callback
     _google_oauth_callback()
@@ -50,13 +72,6 @@ if "media" in st.query_params:
     st.session_state["prefill_title"] = str(st.query_params.get("title", ""))[:200]
     st.session_state["ir_page"] = "🎧 IR Webcast 文字起こし"
     st.query_params.clear()
-
-
-def _app_password():
-    try:
-        return str(st.secrets.get("APP_PASSWORD", "") or "")
-    except Exception:
-        return ""
 
 
 if _app_password() and not st.session_state.get("app_unlocked"):
