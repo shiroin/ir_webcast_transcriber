@@ -46,6 +46,25 @@ def read_source(upload):
     return header, body, None
 
 
+def mostly_japanese(text):
+    sample = (text or "")[:5000]
+    jp = sum(1 for ch in sample if "\u3040" <= ch <= "\u30ff" or "\u4e00" <= ch <= "\u9fff")
+    return bool(sample) and jp / len(sample) > 0.3
+
+
+def detect_slides(upload):
+    """True for a presentation-deck PDF (landscape, little text per page)."""
+    if not upload.name.lower().endswith(".pdf"):
+        return False
+    import fitz
+    from pdf_pipeline import looks_like_slides
+    try:
+        with fitz.open(stream=upload.getvalue(), filetype="pdf") as doc:
+            return looks_like_slides(doc)
+    except Exception:
+        return False
+
+
 def build_combined(earnings, followup, metadata):
     """Combine without rewriting either transcript, with explicit source boundaries."""
     def clean(value):
@@ -79,6 +98,9 @@ def main():
                "原文とJapanese_Translation_付き日本語訳の2つをGoogleドキュメント形式で保存します。")
     st.subheader("Google Drive接続・保存先設定")
     google_login_panel()
+    from automation import master_company_picker
+    master_company_picker("merge_company_pick", {"merge_folder": "transcript_folder", "merge_company": "company"},
+                          label="企業（企業マスターから選ぶと保存先フォルダと企業名を自動入力）")
     folder_url=persistent_text("保存先Google DriveフォルダURL", "merge_folder",
         placeholder="https://drive.google.com/drive/u/0/folders/...")
     st.caption("保存先URLは次のファイルでも引き継がれます。翻訳完了後、自動保存します。")
@@ -102,6 +124,12 @@ def main():
     except Exception as exc:
         st.error(str(exc))
         return
+    st.caption("説明会資料（スライドのPDF）は、AIが1枚ずつ表・グラフを読み取って文章化します。日本語の部分は翻訳しません。")
+    s1, s2 = st.columns(2)
+    e_slides = s1.checkbox("①をスライド資料として文章化", value=detect_slides(earnings_file),
+                           key="merge_e_slides_" + fingerprint, disabled=not earnings_file.name.lower().endswith(".pdf"))
+    f_slides = s2.checkbox("②をスライド資料として文章化", value=detect_slides(followup_file),
+                           key="merge_f_slides_" + fingerprint, disabled=not followup_file.name.lower().endswith(".pdf"))
     st.subheader("③ 統合メタデータ")
     a, b = st.columns(2)
     with a:
@@ -141,54 +169,91 @@ def main():
     cached_rate=st.number_input("キャッシュ入力料金（USD / 100万トークン）",value=0.10,
                                 min_value=0.0,format="%.4f",key="merge_cached_rate")
 
-    original_header, original_body, _=split_metadata(combined)
-    parts=chunks(original_body)
-    # Changes to the uploaded files, metadata or model start a separate translation job.
-    job_id=hashlib.sha256((combined+"\0"+model).encode("utf-8")).hexdigest()
-    done=st.session_state.setdefault("merge_translation_"+job_id,{})
-    st.caption(f"統合本文 {len(original_body):,}文字 / {len(parts)}チャンク。"
-               "途中で停止しても同じ入力・設定で再開できます。")
-    can_translate=bool(api_key and company.strip() and period.strip() and event_date.strip() and parts)
-    if st.button("統合全文の日本語翻訳を開始／再開",type="primary",
-                 disabled=not can_translate,key="merge_translate_start"):
-        progress=st.progress(len(done)/max(len(parts),1))
-        for i,part in enumerate(parts):
-            if i in done:
-                continue
+    slide_model = st.text_input("スライド文章化モデル（画像を読めるモデル）", value="gpt-4.1", key="merge_slide_model")
+    original_header, original_body, _ = split_metadata(combined)
+    sources = [
+        {"key": "e", "title": "Earnings Call", "file": earnings_file, "body": e_body, "slides": e_slides},
+        {"key": "f", "title": "Follow-up Call", "file": followup_file, "body": f_body, "slides": f_slides},
+    ]
+    for src in sources:
+        src["mode"] = "slides" if src["slides"] else ("keep" if mostly_japanese(src["body"]) else "translate")
+        src["parts"] = chunks(src["body"]) if src["mode"] == "translate" else []
+    # Changes to the uploaded files, metadata, models or slide switches start a separate job.
+    job_id = hashlib.sha256((combined + "\0" + model + "\0" + slide_model + "\0" +
+                             "".join(src["mode"] for src in sources)).encode("utf-8")).hexdigest()
+    job = st.session_state.setdefault("merge_job_" + job_id, {"e": {}, "f": {}})
+    label = {"slides": "スライドを文章化", "keep": "日本語のためそのまま", "translate": "翻訳"}
+    st.caption("　".join(f"{src['title']}：{label[src['mode']]}" +
+                        (f"（{len(src['parts'])}チャンク）" if src["mode"] == "translate" else "") for src in sources) +
+               "。途中で停止しても同じ入力・設定で再開できます。")
+
+    def part_done(src):
+        state = job[src["key"]]
+        if src["mode"] == "keep":
+            return True
+        if src["mode"] == "slides":
+            import fitz
+            with fitz.open(stream=src["file"].getvalue(), filetype="pdf") as doc:
+                return len(state.get("slides", {})) == len(doc)
+        return len(state.get("chunks", {})) == len(src["parts"])
+
+    can_translate = bool(api_key and company.strip() and period.strip() and event_date.strip())
+    if st.button("統合全文の日本語化を開始／再開", type="primary", disabled=not can_translate, key="merge_translate_start"):
+        from pdf_pipeline import narrate_slides
+        with st.status("日本語化中…", expanded=True) as status:
             try:
-                done[i]=translate_chunk(api_key,model,part,i+1,len(parts),
-                    "Preserve the Earnings Call and Follow-up Call section boundaries and their order. "
-                    "Do not omit any Q&A or other source material. Preserve original source metadata exactly.")
+                for src in sources:
+                    state = job[src["key"]]
+                    if src["mode"] == "slides":
+                        narrate_slides(state, src["file"].getvalue(), api_key, slide_model, status)
+                    elif src["mode"] == "translate":
+                        done = state.setdefault("chunks", {})
+                        status.update(label=f"{src['title']}を翻訳中…（{len(src['parts'])}チャンク）")
+                        for i, part in enumerate(src["parts"]):
+                            if i not in done:
+                                done[i] = translate_chunk(api_key, model, part, i + 1, len(src["parts"]),
+                                    "Do not omit any Q&A or other source material. Preserve speaker labels and order.")
+                status.update(label="日本語化が完了しました", state="complete")
             except Exception as exc:
-                st.error(f"{i+1}/{len(parts)}チャンクで停止: {exc}。再開できます。")
-                break
-            progress.progress(len(done)/max(len(parts),1))
-    prompt_tokens=sum(v.get("input_tokens",0) for v in done.values())
-    output_tokens=sum(v.get("output_tokens",0) for v in done.values())
-    cached_tokens=sum(v.get("cached_input_tokens",0) for v in done.values())
-    cost=(max(0,prompt_tokens-cached_tokens)*input_rate
-          +cached_tokens*cached_rate+output_tokens*output_rate)/1_000_000
-    c1,c2,c3=st.columns(3)
-    c1.metric("入力トークン",f"{prompt_tokens:,}")
-    c2.metric("出力トークン",f"{output_tokens:,}")
-    c3.metric("推定API料金",f"${cost:.4f}")
-    st.caption("表示額はAPIが返したトークン使用量と設定単価による推定額です。"
+                status.update(label="途中で止まりました", state="error")
+                st.error(f"{exc}。もう一度押すと、終わった部分は使い回して続きから再開します。")
+
+    usage = [v for src in sources for key in ("chunks", "slides") for v in job[src["key"]].get(key, {}).values()]
+    prompt_tokens = sum(v.get("input_tokens", 0) for v in usage)
+    output_tokens = sum(v.get("output_tokens", 0) for v in usage)
+    cached_tokens = sum(v.get("cached_input_tokens", 0) for v in usage)
+    cost = (max(0, prompt_tokens - cached_tokens) * input_rate
+            + cached_tokens * cached_rate + output_tokens * output_rate) / 1_000_000
+    c1, c2, c3 = st.columns(3)
+    c1.metric("入力トークン", f"{prompt_tokens:,}")
+    c2.metric("出力トークン", f"{output_tokens:,}")
+    c3.metric("推定API料金", f"${cost:.4f}")
+    st.caption("表示額はAPIが返したトークン使用量と設定単価による推定額です（スライドの文章化も同じ単価で概算）。"
                "失敗・再試行リクエストの費用が含まれない場合があります。")
-    complete=bool(parts) and len(done)==len(parts) and all(
-        isinstance(done.get(i),dict) and done[i].get("text") for i in range(len(parts))
-    )
-    translated=None
-    translated_name="Japanese_Translation_"+name
+    complete = all(part_done(src) for src in sources)
+    translated = None
+    translated_name = "Japanese_Translation_" + name
     st.caption(f"原文: {name} ／ 日本語訳: {translated_name}")
     if complete:
-        # Preserve combined metadata byte-for-byte, translating the body only.
-        translated=original_header+"\n\n# 本文（日本語訳）\n\n"+(
-            "\n\n".join(done[i]["text"] for i in range(len(parts)))
-        )+"\n"
-        st.success("統合全文の日本語翻訳が完了しました。")
+        sections = []
+        for src in sources:
+            state = job[src["key"]]
+            if src["mode"] == "slides":
+                text = "\n\n".join(f"===== スライド {i + 1} =====\n{state['slides'][i]['text']}"
+                                     for i in range(len(state["slides"])))
+                heading = f"## {src['title']}（説明会資料の文章化）"
+            elif src["mode"] == "keep":
+                text, heading = src["body"].strip(), f"## {src['title']}"
+            else:
+                text = "\n\n".join(state["chunks"][i]["text"] for i in range(len(src["parts"])))
+                heading = f"## {src['title']}（日本語訳）"
+            sections.append(heading + "\n\n" + text)
+        # Preserve combined metadata byte-for-byte; only the body is in Japanese.
+        translated = original_header + "\n\n# 本文（日本語訳）\n\n" + "\n\n".join(sections) + "\n"
+        st.success("統合全文の日本語化が完了しました。")
         st.download_button("統合日本語訳TXTをダウンロード",
                            translated.encode("utf-8-sig"),
-                           file_name=translated_name+".txt",mime="text/plain")
+                           file_name=translated_name + ".txt", mime="text/plain")
     st.subheader("⑤ Google Driveへ自動保存")
     if complete:
         docs = ((name, combined), (translated_name, translated))

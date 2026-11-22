@@ -13,12 +13,12 @@ from google_drive_integration import google_login_panel, parse_folder_id, existi
 from translation_core import chunks, translate_chunk, split_metadata
 
 
-def make_original(pdf_bytes, filename, metadata, page_breaks=True):
+def make_original(pdf_bytes, filename, metadata, page_breaks=True, allow_empty=False):
     with fitz.open(stream=pdf_bytes, filetype='pdf') as doc:
         if doc.needs_pass:
             raise ValueError('パスワード保護されたPDFです。解除してからアップロードしてください。')
         pages = [p.get_text('text', sort=True).strip() for p in doc]
-    if not pages or not any(pages):
+    if not pages or (not any(pages) and not allow_empty):
         raise ValueError('PDFから文字を抽出できません。スキャンPDFはOCR済みのファイルを使用してください。')
     def clean(value):
         return str(value or '').replace('\r',' ').replace('\n',' ').strip()
@@ -89,6 +89,81 @@ def _secret(name, default=""):
         return os.getenv(name, default)
 
 
+def looks_like_slides(doc):
+    """Landscape pages with little text each: a presentation deck rather than a transcript."""
+    pages = list(doc)
+    if not pages:
+        return False
+    landscape = sum(1 for p in pages if p.rect.width > p.rect.height) / len(pages)
+    avg_chars = sum(len(p.get_text("text").strip()) for p in pages) / len(pages)
+    return landscape >= 0.6 and avg_chars < 900
+
+
+SLIDE_PROMPT = (
+    "あなたは決算説明会資料を読み解くアナリストです。1枚のスライド画像（と、そこから機械的に取り出した文字）を、"
+    "決算説明会で話された内容のような日本語の文章にしてください。\n"
+    "- スライドのタイトルと主なメッセージを最初に書く。\n"
+    "- 数値として書いてよいのは、スライドに数字として印刷されている値だけ。表・グラフのラベル・吹き出し・"
+    "小さな注記（例：「3／4」「-24／-28」）も漏らさず読み、どの項目・期間の値かを対応させて書く。\n"
+    "- 取り出した文字に含まれる数字はスライドに実在する。画像と食い違うときは、その数字を優先して確かめる。\n"
+    "- グラフに数字のラベルがない部分は、目盛りから値を推定して書かない。増加・減少・横ばいなどの傾向だけを書く。\n"
+    "- 表は、行と列の見出しを付けて数字をすべて文章にする（単位・期間・前年比・増減率を落とさない）。\n"
+    "- 図や写真は、資料が伝えようとしている内容だけを書く。\n"
+    "- スライドに書かれていないこと（推測・評価・一般論）は書かない。表紙・区切り・免責事項は1文で済ませる。\n"
+    "- 見出し記号やMarkdownは使わず、段落の文章で書く。")
+
+
+def describe_slide(api_key, model, png, page_text, page_no, total):
+    """One slide image -> Japanese prose. Returns {"text", "input_tokens", "output_tokens"}."""
+    import base64
+    import time
+    import requests
+    payload = {"model": model, "temperature": 0, "messages": [
+        {"role": "system", "content": SLIDE_PROMPT},
+        {"role": "user", "content": [
+            {"type": "text", "text": f"スライド {page_no}/{total}。取り出した文字（順序や対応は崩れていることがある）:\n{page_text[:3000]}"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode(),
+                                                "detail": "high"}}]}]}
+    last = None
+    for attempt in range(4):
+        try:
+            r = requests.post("https://api.openai.com/v1/chat/completions", headers={"Authorization": f"Bearer {api_key}"},
+                              json=payload, timeout=180)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last = f"HTTP {r.status_code}"
+                time.sleep(min(2 ** attempt * 3, 30))
+                continue
+            if not r.ok:
+                raise RuntimeError(f"OpenAI API HTTP {r.status_code}: {r.text[:300]}")
+            data = r.json()
+            usage = data.get("usage") or {}
+            return {"text": data["choices"][0]["message"]["content"].strip(),
+                    "input_tokens": int(usage.get("prompt_tokens") or 0),
+                    "output_tokens": int(usage.get("completion_tokens") or 0)}
+        except requests.RequestException as exc:
+            last = str(exc)
+            time.sleep(min(2 ** attempt * 3, 30))
+    raise RuntimeError(f"スライド{page_no}の文章化に失敗しました: {last}")
+
+
+def narrate_slides(job, data, api_key, model, status):
+    """Every slide in order; finished slides are kept in job["slides"] so a retry continues."""
+    done = job.setdefault("slides", {})
+    with fitz.open(stream=data, filetype="pdf") as doc:
+        total = len(doc)
+        if len(done) < total:
+            status.update(label=f"スライドを1枚ずつ文章化中…（{total}枚）")
+            progress = st.progress(len(done) / total)
+            for i, page in enumerate(doc):
+                if i in done:
+                    continue
+                zoom = 1400 / max(page.rect.width, page.rect.height)  # ~1400px on the long side
+                png = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom)).tobytes("png")
+                done[i] = describe_slide(api_key, model, png, page.get_text("text", sort=True), i + 1, total)
+                progress.progress(len(done) / total)
+    return "\n\n".join(f"===== スライド {i + 1} =====\n{done[i]['text']}" for i in range(total))
+
+
 def run_pipeline(job, data, filename, source_url, item, api_key, settings):
     """All steps for one PDF. Each finished step is stored in `job`, so a retry continues where it stopped."""
     import analysis_note
@@ -110,8 +185,13 @@ def run_pipeline(job, data, filename, source_url, item, api_key, settings):
         if not meta["period"]:
             raise RuntimeError("決算期を判定できませんでした。下の欄に決算期を入力して「再開」を押してください。")
 
-        original, header, body, _ = make_original(data, filename, meta, settings.get("page_breaks", True))
-        parts = chunks(body)
+        original, header, body, _ = make_original(data, filename, meta, settings.get("page_breaks", True),
+                                                  allow_empty=bool(settings.get("slides")))
+        if settings.get("slides"):
+            # Slides: the extracted text loses table and chart structure, so each slide is read as an image.
+            narrative = narrate_slides(job, data, api_key, settings.get("slide_model", "gpt-4.1"), status)
+            translated = header + "\n\n# 本文（スライド資料の文章化）\n\n" + narrative + "\n"
+        parts = [] if settings.get("slides") else chunks(body)
         done = job.setdefault("chunks", {})
         if len(done) < len(parts):
             status.update(label=f"全文を日本語に翻訳中…（{len(parts)}チャンク）")
@@ -120,7 +200,8 @@ def run_pipeline(job, data, filename, source_url, item, api_key, settings):
                 if i not in done:
                     done[i] = translate_chunk(api_key, settings["model"], part, i + 1, len(parts), "")
                     progress.progress(len(done) / len(parts))
-        translated = header + "\n\n# 本文（日本語訳）\n\n" + "\n\n".join(done[i]["text"] for i in range(len(parts))) + "\n"
+        if not settings.get("slides"):
+            translated = header + "\n\n# 本文（日本語訳）\n\n" + "\n\n".join(done[i]["text"] for i in range(len(parts))) + "\n"
 
         base = metadata_filename(meta)
         original_title, translated_title = base + "_Original", "Japanese_Translation_" + base + "_Original"
@@ -148,7 +229,7 @@ def show_results(job):
         st.markdown(f"- [05_決算分析ノート]({job['note']['doc_url']})")
     for title, doc_id in (job.get("docs") or {}).items():
         st.markdown(f"- [{title}](https://docs.google.com/document/d/{doc_id}/edit)")
-    usage = [v for v in (job.get("chunks") or {}).values()]
+    usage = [v for v in (job.get("chunks") or {}).values()] + [v for v in (job.get("slides") or {}).values()]
     if usage:
         st.caption(f"翻訳トークン：入力{sum(v.get('input_tokens', 0) for v in usage):,}／"
                    f"出力{sum(v.get('output_tokens', 0) for v in usage):,}")
@@ -156,7 +237,7 @@ def show_results(job):
 
 def main():
     import company_registry
-    from automation import guess_company_from_document
+    from automation import guess_company_from_document, guess_company_with_ai
     from google_drive_integration import ensure_google_auth
     st.title('📄 PDF決算スクリプト → 日本語訳 → Google Drive')
     st.caption('PDFをアップロードするかURLを貼るだけで、企業判定 → 決算期・説明会日の判定 → 全文日本語訳 → '
@@ -179,6 +260,8 @@ def main():
             'note': st.checkbox('05_決算分析ノートに追記する', value=True, key='pdf_note_enabled'),
         }
         settings['page_breaks'] = st.checkbox('ページ区切りを残す', value=True, key='pdf_page_breaks')
+        # gpt-4.1-mini invented values in a test deck ("その他・全社 600億円" for a printed 3／4); gpt-4.1 did not.
+        settings['slide_model'] = st.text_input('スライド文章化モデル（画像を読めるモデル）', value='gpt-4.1', key='pdf_slide_model')
 
     source = st.radio('入力方法', ['PDFファイル', 'PDFのURL'], horizontal=True, key='pdf_source_kind')
     data, filename, source_url = None, '', ''
@@ -213,18 +296,30 @@ def main():
                 job['pdf_title'] = (doc.metadata or {}).get('title') or ''
                 job['pages'] = len(doc)
                 job['text'] = '\n'.join(p.get_text('text', sort=True) for p in doc)
+                job['is_slides'] = looks_like_slides(doc)
         except Exception as exc:
             st.error(f'PDFを開けませんでした: {exc}')
             return
         if not job['text'].strip():
-            st.error('PDFから文字を抽出できません。スキャンPDFはOCR済みのファイルを使用してください。')
-            return
+            # Image-only PDF: only slide narration (reading the page images) can make text from it.
+            job['is_slides'] = True
     st.caption(f"{filename} ／ {job['pages']}ページ ／ {len(job['text']):,}文字")
+    settings['slides'] = st.checkbox(
+        'プレゼン資料（スライド）として、AIが1枚ずつ表・グラフを読み取って文章化する',
+        value=job.get('is_slides', False), key='pdf_slides_' + fingerprint[:12],
+        help='横長で文字の少ないPDFは自動でオンになります。オフにすると、取り出した文字をそのまま翻訳します。')
+
 
     labels = [company_registry.label(c) for c in companies]
     if 'company_label' not in job:
-        guessed = guess_company_from_document(companies, [filename, job.get('pdf_title', ''), source_url],
-                                              job['text'])
+        titles = [filename, job.get('pdf_title', ''), source_url]
+        guessed = guess_company_from_document(companies, titles, job['text'])
+        if not guessed and companies and api_key:
+            # Names can differ in language (Hon Hai vs 鴻海精密工業); let the model match against the master list.
+            try:
+                guessed = guess_company_with_ai(api_key, companies, titles, job['text'])
+            except Exception as exc:
+                st.caption(f'企業のAI判定に失敗しました（手動で選んでください）: {exc}')
         job['company_label'] = company_registry.label(guessed) if guessed else None
     options = ['（企業を選択）'] + labels
     default = options.index(job['company_label']) if job['company_label'] in options else 0
