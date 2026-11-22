@@ -52,6 +52,10 @@ if "media" in st.query_params:
     st.session_state["webcast_url"] = _media
     st.session_state["prefill_src"] = str(st.query_params.get("src", ""))[:500]
     st.session_state["prefill_title"] = str(st.query_params.get("title", ""))[:200]
+    if st.query_params.get("paste"):
+        # The bookmarklet copied the full article text to the clipboard: wait for it to be pasted.
+        st.session_state["autostart_requested"] = False
+        st.session_state["awaiting_paste_notice"] = True
     st.session_state["ir_page"] = "🎧 IR Webcast 文字起こし"
     st.query_params.clear()
 
@@ -382,6 +386,45 @@ def page_transcript(page_url):
         if speakers >= 5 and len(text) >= 20000 and len(text) > len(best):
             best = text
     return best
+
+
+def is_logmi(url):
+    return (urlparse((url or "").strip()).hostname or "").endswith("logmi.jp")
+
+
+def logmi_article(url):
+    """Public part of a logmi Finance transcript: title, description, section text, and locked sections.
+
+    Sections after the lock (usually the Q&A) are shown only to logged-in members, so a server fetch gets the
+    prepared remarks only; the bookmarklet copies the full text from the user's own logged-in browser instead."""
+    cache = st.session_state.setdefault("logmi_cache", {})
+    if url in cache:
+        return cache[url]
+    info = {"title": "", "description": "", "text": "", "locked": []}
+    try:
+        html = fetch_html(url).text
+        soup = BeautifulSoup(html, "html.parser")
+        og = soup.find("meta", attrs={"property": "og:title"})
+        desc = soup.find("meta", attrs={"name": "description"})
+        info["title"] = (og.get("content") if og else (soup.title.get_text(strip=True) if soup.title else "")) or ""
+        info["description"] = (desc.get("content") if desc else "") or ""
+        parts = []
+        for section in soup.find_all("section", id=re.compile(r"^s\d+$")):
+            lines = [x.get_text(" ", strip=True) for x in section.find_all(["h2", "h3", "p"])]
+            parts.append("\n\n".join(x for x in lines if x))
+        info["text"] = "\n\n".join(x for x in parts if x)
+        # Section list in the page data: "lock":0 marks a members-only section.
+        info["locked"] = re.findall(r'\\"heading\\":\\"([^"\\]+)\\",\\"lock\\":0\b', html)
+    except Exception:
+        pass
+    cache[url] = info
+    return info
+
+
+def mostly_japanese(text):
+    sample = (text or "")[:5000]
+    jp = sum(1 for ch in sample if "\u3040" <= ch <= "\u30ff" or "\u4e00" <= ch <= "\u9fff")
+    return bool(sample) and jp / len(sample) > 0.3
 
 
 def brightcove_player_url(page_url):
@@ -1399,6 +1442,8 @@ if companies:
     labels = [company_registry.label(c) for c in companies]
     pending_url = str(st.session_state.get("webcast_url", "")).strip()
     yt = youtube_info(pending_url) if is_youtube(pending_url) else {}
+    if is_logmi(pending_url):
+        yt = {"title": logmi_article(pending_url).get("title", ""), "channel": ""}
     # Fill only when nothing is chosen yet, so a manual choice is never overwritten.
     if st.session_state.get("company_select") in (None, "（選択しない）"):
         guessed = company_registry.guess_company(companies, st.session_state.get("prefill_title", ""),
@@ -1452,6 +1497,37 @@ st.subheader("② 音声・動画URL")
 url = st.text_input("URL", key="webcast_url",
                     placeholder="YouTube / Vimeo / Q4 videoRecordingLink / .mp3 / .m3u8 / .ts / IR Webcasting 等").strip()
 
+pasted_text = st.text_area(
+    "書き起こしテキストを貼り付け（任意）", key="pasted_transcript", height=140,
+    placeholder="logmiなどの書き起こしサイトの全文を貼ると、音声の代わりにこれを原文として要約・ノート追記まで進めます。").strip()
+with st.expander("質疑応答などの追加の原文（任意）：本編は動画、質疑応答はファイル、のような場合",
+                 expanded=bool(st.session_state.get("extra_source_file") or st.session_state.get("extra_source_text"))):
+    st.caption("本編（上のURL・アップロード・貼り付け）の文字起こしの後ろに「# 質疑応答」としてつなげ、"
+               "まとめて日本語訳・Drive保存・05_決算分析ノート追記まで進めます。日本語の部分は翻訳しません。")
+    extra_file = st.file_uploader("質疑応答のファイル（PDF / TXT）", type=["pdf", "txt"], key="extra_source_file")
+    extra_pasted = st.text_area("または質疑応答のテキストを貼り付け", key="extra_source_text", height=120).strip()
+extra_text, extra_label = "", ""
+if extra_file is not None:
+    try:
+        from merge_calls import read_source
+        _, extra_text, _ = read_source(extra_file)
+        extra_text, extra_label = extra_text.strip(), Path(extra_file.name).name
+        st.caption(f"追加の原文：{extra_label}（{len(extra_text):,}文字）")
+    except Exception as exc:
+        st.error(f"質疑応答のファイルを読み込めません: {exc}")
+if extra_pasted:
+    extra_text = (extra_text + "\n\n" + extra_pasted).strip()
+    extra_label = (extra_label + "＋" if extra_label else "") + "貼り付けテキスト"
+article_meta = logmi_article(url) if is_logmi(url) else {}
+if st.session_state.pop("awaiting_paste_notice", False) and not pasted_text:
+    st.info("ブックマークレットが記事の全文をクリップボードにコピーしました。上の「書き起こしテキスト」欄に貼り付けて（⌘V）、"
+            "「文字起こし開始」を押してください。")
+elif article_meta and not pasted_text:
+    st.caption(f"ログミーファイナンス：{article_meta.get('title', '')}")
+    if article_meta.get("locked"):
+        st.warning(f"この記事の後半（{len(article_meta['locked'])}区切り：{article_meta['locked'][0]} など）は会員限定で、"
+                   "URLからは取り込めません。全文を使うには、logmiにログインした状態で記事を開き、ブックマークレットを押して、"
+                   "コピーされた全文を上の欄に貼り付けてください。このまま進めると、公開部分だけで要約します。")
 youtube_meta = youtube_info(url) if is_youtube(url) else {}
 if is_youtube(url):
     if youtube_meta.get("title"):
@@ -1538,7 +1614,8 @@ with c1:
 with c2:
     # Japanese companies and /ja/ URLs default to Japanese; everything else to English.
     japanese_call = ((selected or {}).get("country") == "日本"
-                     or re.search(r"(?:^|[/_.-])ja(?:$|[/_.-])", urlparse(url).path.lower()) is not None)
+                     or re.search(r"(?:^|[/_.-])ja(?:$|[/_.-])", urlparse(url).path.lower()) is not None
+                     or is_logmi(url) or mostly_japanese(pasted_text))
     language = st.selectbox(
         "言語", ["en", "zh", "ko", "ja", "auto"], index=3 if japanese_call else 0,
         format_func=lambda x: {"en":"英語","zh":"中国語（標準中国語）","ko":"韓国語","ja":"日本語","auto":"自動判定"}[x],
@@ -1653,8 +1730,10 @@ if st.session_state.pop("autostart_requested", False):
         st.warning("企業を自動判定できませんでした。企業を選んで「文字起こし開始」を押してください。")
 
 if st.button("文字起こし開始", type="primary", use_container_width=True) or auto_run:
-    if not url.strip() and uploaded_media is None:
-        st.warning("URLを貼るか、音声・動画ファイルをアップロードしてください。")
+    if not url.strip() and uploaded_media is None and not pasted_text and extra_text:
+        pasted_text, extra_text, extra_label = extra_text, "", ""
+    if not url.strip() and uploaded_media is None and not pasted_text:
+        st.warning("URLを貼るか、音声・動画ファイルをアップロードするか、書き起こしテキストを貼り付けてください。")
         st.stop()
     if not api_key:
         st.error("OpenAI API Key が必要です。画面に入力するか、Streamlit Secrets に OPENAI_API_KEY を設定してください。")
@@ -1682,7 +1761,13 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
             media_title = ""
             source_kind = kind(url)
 
-            if uploaded_media is not None:
+            if pasted_text:
+                direct_caption_text = pasted_text
+                source = "貼り付けた書き起こしテキスト" + ("（ログミーファイナンス）" if is_logmi(url) else "")
+            elif is_logmi(url) and article_meta.get("text"):
+                direct_caption_text = article_meta["text"]
+                source = "ログミーファイナンス（公開部分）" if article_meta.get("locked") else "ログミーファイナンス"
+            elif uploaded_media is not None:
                 status.info('アップロードされた音声・動画から音声抽出中…')
                 audio=transcode_uploaded_audio(uploaded_media,audio)
                 source='Uploaded media: '+Path(uploaded_media.name).name+(' (YouTube)' if is_youtube(url) else '')
@@ -1811,6 +1896,12 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                     progress_bar=progress_bar, progress_text=progress_text, usage_stats=transcribe_usage,
                 )
 
+            main_text = text
+            extra_heading = f"\n\n# 質疑応答（追加の原文：{extra_label}）\n\n" if extra_text else ""
+            if extra_text:
+                text = main_text.rstrip() + extra_heading + extra_text + "\n"
+                st.caption(f"本編（{len(main_text):,}文字）の後ろに、質疑応答（{len(extra_text):,}文字）をつなげました。")
+
             if not earnings_period.strip() or not earnings_date.strip():
                 status.info("決算期・説明会日をスクリプトから判定中…")
                 hints = "\n".join(x for x in [
@@ -1818,6 +1909,8 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                     f"Webcast page: {st.session_state.get('prefill_src', '')}",
                     f"Recording started (UTC): {q4_media.get('recording_started_at', '')}",
                     f"Video title: {media_title}",
+                    f"Article title: {article_meta.get('title', '')}",
+                    f"Article description: {article_meta.get('description', '')}",
                     f"YouTube title: {youtube_meta.get('title', '')} / channel: {youtube_meta.get('channel', '')}"
                     if youtube_meta.get("title") else "YouTube title: ",
                     f"Media Last-Modified: {media_last_modified(url) if url.strip() and not is_youtube(url) else ''}",
@@ -1840,6 +1933,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
             if event_type: tags.append(f"種別: {event_type}")
             tags.append(f"URL: {url}")
             tags.append(f"Transcription model: {api_model}" if direct_caption_text is None else f"Transcript source: {source}")
+            if extra_text: tags.append(f"Q&A source: {extra_label}")
             metadata = "# IR Webcast Metadata\n" + "\n".join(f"- {x}" for x in tags)
             transcript_with_tags = metadata + "\n\n# Transcript\n" + text
 
@@ -1865,16 +1959,22 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                 status.info("日本語訳を作成中…")
                 # Keep metadata deterministic: copy field values from the source verbatim.
                 # Translate only the transcript body so the model cannot omit or alter tags.
-                if language == "ja":
-                    # Already Japanese: keep the transcript as the Japanese text instead of paying to "translate" it.
-                    translated_body = text
-                    st.caption("日本語の説明会のため、翻訳APIは使わず文字起こしをそのまま日本語版として保存します。")
-                else:
-                    translated_body = translate_to_japanese(text, api_key, usage_stats=translation_usage)
+                # Main part and Q&A part are judged separately (e.g. English video + Japanese Q&A file).
+                parts = [("本編", "", main_text, language == "ja" or mostly_japanese(main_text))]
+                if extra_text:
+                    parts.append(("質疑応答", extra_heading, extra_text, mostly_japanese(extra_text)))
+                translated_body = ""
+                for name, heading, part, is_japanese in parts:
+                    translated_body += heading + (part if is_japanese else
+                                                  translate_to_japanese(part, api_key, usage_stats=translation_usage))
+                kept = [name for name, _, _, is_japanese in parts if is_japanese]
+                if kept:
+                    # Already Japanese: keep it as the Japanese text instead of paying to "translate" it.
+                    st.caption(f"日本語の部分（{'・'.join(kept)}）は翻訳APIを使わず、そのまま日本語版に入れました。")
                 japanese_metadata = "# IR Webcast メタデータ\n" + "\n".join(
                     "- " + line.replace("Transcription model:", "文字起こしモデル:")
                                .replace("Transcript source:", "原文取得元:")
-                    for line in tags
+                    for line in [t.replace("Q&A source:", "質疑応答の原文:") for t in tags]
                 )
                 japanese_translation = japanese_metadata + "\n\n# 日本語訳\n" + translated_body
                 st.text_area("日本語訳", japanese_translation, height=450)
