@@ -5,6 +5,34 @@ import streamlit as st
 import company_registry
 
 
+def _ticker_patterns(ticker):
+    """Regexes for a ticker as it is written in titles and transcripts.
+
+    Letter tickers (AMD, NVDA) match as words. Numeric codes (8309, TPE:2317) match only in code form —
+    "8309.T", "2317.TW", "(8309)", "TPE:2317", "証券コード8309" — never as a bare number, because filenames
+    carry dates and document IDs (Hon_Hai_..._20261112_8309.pdf is not 三井住友トラスト 8309).
+    Codes also have to come with their own exchange's marker."""
+    ticker = (ticker or "").strip()
+    code = ticker.split(":")[-1].strip()
+    if not code:
+        return []
+    if not code.isdigit():
+        return [r"(?<![a-z0-9])" + re.escape(code.lower()) + r"(?![a-z0-9])"] if len(code) >= 2 else []
+    c = re.escape(code)
+    # The same number exists on several exchanges (2371 = Tatung in Taipei, Kakaku.com in Tokyo), so a code
+    # only counts with its own exchange's suffix or prefix. No prefix in the master means Tokyo.
+    exchange = ticker.split(":")[0].strip().upper() if ":" in ticker else "TSE"
+    suffixes, prefixes = {
+        "TSE": ("t", "tse|tyo|証券コード"), "TPE": ("tw|two", "tpe|twse|tpex"), "HKG": ("hk", "hkg|hkex"),
+        "SHA": ("ss", "sha|sse"), "SHE": ("sz", "she|szse"), "KRX": ("ks|kq", "krx|kosdaq"),
+    }.get(exchange, ("t", "tse"))
+    patterns = [r"(?<![0-9])" + c + r"\.(?:" + suffixes + r")(?![a-z])",
+                r"(?:" + prefixes + r")\s*[:：]?\s*" + c + r"(?![0-9])"]
+    if exchange == "TSE":
+        patterns.append(r"[（(]\s*" + c + r"\s*[)）]")  # 「三井住友トラスト（8309）」 is a Japanese convention
+    return patterns
+
+
 def guess_company_from_document(companies, title_texts, body_text):
     """Company for a transcript: title/filename matches count most, then mentions in the opening.
 
@@ -20,12 +48,65 @@ def guess_company_from_document(companies, title_texts, body_text):
                 continue
             pattern = r"(?<![a-z0-9])" + re.escape(name) + r"(?![a-z0-9])"
             score += 5 * len(re.findall(pattern, titles)) + len(re.findall(pattern, head))
-        ticker = (item.get("ticker") or "").strip().lower()
-        if len(ticker) >= 2 and re.search(r"(?<![a-z0-9])" + re.escape(ticker) + r"(?![a-z0-9])", titles):
-            score += 5
+        for pattern in _ticker_patterns(item.get("ticker")):
+            if re.search(pattern, titles):
+                score += 5
+            elif re.search(pattern, head[:1500]):
+                score += 3
         if score > best_score:
             best, best_score = item, score
     return best if best_score >= 2 else None
+
+
+def guess_company_with_ai(api_key, companies, title_texts, body_text, model="gpt-4.1-mini"):
+    """Fallback when names do not match literally (English "Hon Hai" vs master "鴻海精密工業").
+
+    Shows the model the master list and the transcript opening; accepts only a row that exists."""
+    import json
+    import requests
+    listing = "\n".join(f"{c['row']}|{c.get('company', '')}|{c.get('japanese_name', '')}|{c.get('ticker', '')}"
+                         for c in companies)
+    schema = {"type": "object", "additionalProperties": False, "required": ["row", "reason"],
+              "properties": {"row": {"type": "integer"}, "reason": {"type": "string"}}}
+    payload = {"model": model, "temperature": 0,
+               "response_format": {"type": "json_schema", "json_schema": {"name": "company", "strict": True, "schema": schema}},
+               "messages": [
+                   {"role": "system", "content": "Identify which company held this earnings call. Pick the row number from the "
+                    "company list (row|company|Japanese name|ticker). Names may differ in language or form (e.g. Hon Hai / "
+                    "Foxconn = 鴻海精密工業). The reporting company is the one presenting results, not analysts, banks or "
+                    "customers mentioned. Return row 0 if it is not in the list."},
+                   {"role": "user", "content": "Company list:\n" + listing + "\n\nFile/title: " +
+                    " / ".join(t for t in title_texts if t) + "\n\nTranscript opening:\n" + (body_text or "")[:3000]}]}
+    r = requests.post("https://api.openai.com/v1/chat/completions", headers={"Authorization": f"Bearer {api_key}"},
+                      json=payload, timeout=120)
+    r.raise_for_status()
+    row = json.loads(r.json()["choices"][0]["message"]["content"]).get("row")
+    return next((c for c in companies if c["row"] == row), None)
+
+
+def master_company_picker(key, fill, label="企業（企業マスターから選ぶと保存先フォルダを自動入力）"):
+    """Selectbox over the company master. Choosing a company copies its fields into other widgets' session keys,
+    e.g. fill={"merge_folder": "transcript_folder"}; those inputs stay editable. Returns the chosen row or None."""
+    from google_drive_integration import ensure_google_auth
+    if not ensure_google_auth():
+        return None
+    try:
+        companies = company_registry.load_companies()
+    except Exception as exc:
+        st.warning(f"企業マスター（スプレッドシート）を読み込めません: {exc}")
+        return None
+    labels = [company_registry.label(c) for c in companies]
+
+    def apply():
+        choice = st.session_state.get(key)
+        if choice in labels:
+            item = companies[labels.index(choice)]
+            for state_key, field in fill.items():
+                # Also the "pref_" shadow kept by workflow_utils.persistent_text, so the value survives reruns.
+                st.session_state[state_key] = st.session_state["pref_" + state_key] = item.get(field, "")
+
+    choice = st.selectbox(label, ["（選択しない）"] + labels, key=key, on_change=apply)
+    return companies[labels.index(choice)] if choice in labels else None
 
 
 def save_docs_once(folder_id, documents):

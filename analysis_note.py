@@ -235,25 +235,40 @@ def _paragraphs(document):
         yield element, para.get("paragraphStyle", {}).get("namedStyleType", ""), text.strip()
 
 
-def find_insert_index(document, period):
-    """Index of the newest quarter heading (first non-empty HEADING_1), or end of document.
+# A quarter heading in any style: older notes wrote "FY2026 Q4｜2026年8月12日｜参照：…" or
+# "FY2026 Q2（2026年7月28日）…" as plain text, not as HEADING_1.
+QUARTER_HEADING = re.compile(r"^(?:FY\s?\d{4}\s*Q[1-4]|\d{4}年\d{1,2}月期|Q[1-4]\s*FY\s?\d{2,4}|\d{4}\s*Q[1-4])"
+                             r"[^\n]{0,40}?[｜|（(—]")
 
-    Returns (index, already_present, needs_paragraph_break)."""
-    first_h1, last = None, None
-    for element, style, text in _paragraphs(document):
-        last = (element, text)
-        if style == "HEADING_1" and text:
-            if text.startswith(period + "｜"):
-                return element["startIndex"], True, False
-            if first_h1 is None:
-                first_h1 = element["startIndex"]
-    if first_h1 is not None:
-        return first_h1, False, False
-    if last is None:
+
+def is_quarter_heading(text):
+    """Quarter heading line; long body paragraphs that merely start with a period name do not count."""
+    return len(text) <= 200 and "。" not in text and QUARTER_HEADING.match(text) is not None
+
+
+def find_insert_index(document, period):
+    """Index of the newest quarter heading (the first one, whatever its style), so the new quarter goes on top.
+
+    Without any quarter yet, insert right after the title and the 更新方針 line. Returns
+    (index, already_present, needs_paragraph_break)."""
+    paragraphs = [(element, style, text) for element, style, text in _paragraphs(document)]
+    for element, style, text in paragraphs:
+        if text.startswith((period + "｜", period + "（", period + "(")):
+            return element["startIndex"], True, False
+    for element, style, text in paragraphs:
+        if text and (style == "HEADING_1" or is_quarter_heading(text)):
+            return element["startIndex"], False, False
+    non_empty = [(e, s, t) for e, s, t in paragraphs if t]
+    if not non_empty:
         return 1, False, False
-    element, text = last
-    # Append after the last paragraph; if it has text, end it first so it is not merged.
-    return (element["startIndex"], False, False) if not text else (element["endIndex"] - 1, False, True)
+    # Skip the title line and an 更新方針 line, then insert before whatever follows (or at the end).
+    skip = 1 if (non_empty[0][1] == "TITLE" or "決算分析ノート" in non_empty[0][2]) else 0
+    if len(non_empty) > skip and non_empty[skip][2].startswith("更新方針"):
+        skip += 1
+    if len(non_empty) > skip:
+        return non_empty[skip][0]["startIndex"], False, False
+    element = non_empty[-1][0]
+    return element["endIndex"] - 1, False, True
 
 
 def note_title(company):

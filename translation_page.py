@@ -386,6 +386,9 @@ def _convert_txt_file(file_info, folder_id, headers):
 def folder_converter_page():
     st.subheader('📁 フォルダ内TXT → Googleドキュメント一括変換')
     st.caption('指定フォルダ直下のTXTをGoogleドキュメント形式で同じフォルダに新規作成。元のTXTは削除しません。')
+    from automation import master_company_picker
+    master_company_picker('convert_company_pick', {'convert_folder_url': 'transcript_folder'},
+                          label='企業（企業マスターから選ぶとQuarterly_AnalysisフォルダのURLを自動入力）')
     folder_url = st.text_input('Google DriveフォルダURL', key='convert_folder_url',
                                placeholder='https://drive.google.com/drive/u/0/folders/...')
     google_login_panel()

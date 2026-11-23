@@ -26,14 +26,35 @@ v41の「🎧 IR Webcast 文字起こし」画面を、次の1本の流れで動
 - `ir_discovery.py`（新規）：IRページのWebcastリンク探索と、ブックマークレットの生成。
 - `analysis_note.py`（新規）：決算期・説明会日の判定、分析の生成、Googleドキュメントへの追記。
 - `google_drive_integration.py`：`GOOGLE_REFRESH_TOKEN` による自動接続、汎用Google API呼び出し。
-- `app.py`：Webcast画面に企業選択・自動判定・ノート追記を追加。`APP_PASSWORD`（Cloud版では必須。未設定だと起動しない）。不具合修正2件（下記）。
+- `app.py`：Webcast画面に企業選択・自動判定・ノート追記を追加。`APP_PASSWORD`（任意）。不具合修正2件（下記）。
 - `workflow_utils.py` はこのZIPに含まれていません。GitHubにある既存ファイルをそのまま残してください（削除しないこと）。
+
+## Google接続：OAuth同意画面が「テスト」のままでも動かす（Apps Script方式・推奨）
+
+同意画面が「テスト」だと `GOOGLE_REFRESH_TOKEN` は7日で失効します。代わりに、自分のGoogleアカウントで小さなApps Script（`apps_script/` フォルダ）を公開し、アプリはそこから1時間有効なアクセストークンを受け取ります。Apps Scriptの承認には7日の期限がなく、Google CloudでのDocs/Sheets APIの有効化も不要です。
+
+1. https://script.google.com を開き「新しいプロジェクト」。名前は例えば「IR Transcriber Token Bridge」。
+2. 左の歯車「プロジェクトの設定」で「『appsscript.json』マニフェスト ファイルをエディタで表示する」にチェック。
+3. エディタに戻り、`appsscript.json` の中身を `apps_script/appsscript.json` の内容に、`コード.gs` の中身を `apps_script/Code.gs` の内容に、それぞれ全部置き換えて保存（⌘S）。
+4. 上部の関数の選択欄で `setup` を選んで「実行」。承認画面が出たら、アカウントを選び「詳細」→「（プロジェクト名）（安全ではないページ）に移動」→「許可」。下の実行ログに `GOOGLE_BRIDGE_SECRET = "…"` が表示されるのでコピー。
+5. 右上「デプロイ」→「新しいデプロイ」→ 種類の選択（歯車）で「ウェブアプリ」。「次のユーザーとして実行」は**自分**、「アクセスできるユーザー」は**全員**にして「デプロイ」。表示された「ウェブアプリのURL」（`…/exec` で終わる）をコピー。
+6. Streamlit CloudのSecrets と、Macの `~/.streamlit/secrets.toml` の両方に追記して保存：
+
+```toml
+GOOGLE_BRIDGE_URL = "https://script.google.com/macros/s/……/exec"
+GOOGLE_BRIDGE_SECRET = "……"
+```
+
+画面の「Google Drive接続」が「自動接続済み（Apps Script）」になれば完了です。`GOOGLE_REFRESH_TOKEN` は不要になります（残っていても Apps Script が優先されます）。
+
+- 「全員」に公開しても、合言葉を知らない呼び出しには何も返しません。合言葉はパスワードと同じ扱いにしてください。漏れた疑いがあるときは Apps Script で `rotateSecret` を実行し、新しい合言葉をSecretsに入れ直します。
+- Code.gs を書き換えたときは「デプロイ」→「デプロイを管理」→ 編集（鉛筆）→ バージョン「新バージョン」で更新します（URLは変わりません）。
 
 ## 初回セットアップ（1回だけ）
 
 1. **Google Cloud で API を有効化**：OAuthクライアントがあるプロジェクトで、*Google Docs API* と *Google Sheets API* を有効化（Drive APIは有効化済みのはず）。
 2. **OAuth同意画面を「本番環境（In production）」にする**：「テスト」のままだとリフレッシュトークンが7日で失効します。個人利用なら未審査のままで構いません（ログイン時に警告が出るだけです）。
-3. **アプリを非公開にする**：トークンを保存すると、アプリを開いた人は誰でもあなたのDriveに書き込め、OpenAIの料金も使えてしまいます。Streamlit Community Cloudの *Share* 設定でアプリを非公開にし、閲覧者を自分だけにしてください（Streamlitのログインはブラウザに保持されます）。加えて `APP_PASSWORD` を必ず設定してください（未設定だとCloud版は起動しません）。
+3. **アプリを非公開にする**：トークンを保存すると、アプリを開いた人は誰でもあなたのDriveに書き込め、OpenAIの料金も使えてしまいます。Streamlit Community Cloudの *Share* 設定でアプリを非公開にし、閲覧者を自分だけにしてください（Streamlitのログインはブラウザに保持されます）。追加の対策として `APP_PASSWORD` も設定できます。
 4. デプロイ後、一度だけ「Googleアカウントでログイン」→ 表示される「次回からログイン不要にする」を開き、`GOOGLE_REFRESH_TOKEN = "..."` をコピー。
 5. Streamlit Cloud の Secrets に追記：
 
@@ -45,7 +66,7 @@ GOOGLE_REDIRECT_URI = "https://irwebcasttranscriber-2ytgsid2pfpmajk8qrvqvv.strea
 GOOGLE_OAUTH_STATE_SECRET = "..."
 GOOGLE_REFRESH_TOKEN = "..."          # 手順4で取得
 APP_URL = "https://irwebcasttranscriber-2ytgsid2pfpmajk8qrvqvv.streamlit.app"   # ブックマークレット用
-APP_PASSWORD = "..."                  # 必須（Cloud版）。未設定だと起動しない。セッションごとにパスワードを確認
+# APP_PASSWORD = "..."                # 任意。設定するとセッションごとにパスワードを確認
 # COMPANY_SHEET_ID / COMPANY_SHEET_NAME  # 企業マスターを変える場合のみ
 ```
 
@@ -96,7 +117,7 @@ Cloud版はYouTubeから直接取得できない（403）ため、YouTubeのURL�
 2. Macで `download_youtube_mac.command` をダブルクリックし、同じURLを貼ります。音声MP3（モノラル64kbps、1時間で約30MB）が「ダウンロード/YouTube音声」に、`公開日_タイトル.mp3` の名前で保存され、Finderで表示されます。
 3. Cloud版の「YouTube取得診断・ローカルファイル代替」にそのMP3をアップロードし、「文字起こし開始」を押します。文字起こし → 決算期・説明会日の判定（動画タイトルとファイル名の公開日も手掛かりにする）→ 日本語訳 → Drive保存 → 決算分析ノート追記まで、URLのときと同じ流れで進みます。元のYouTube URLは参照元として記録されます。
 
-ほかの方法で保存した音声・動画ファイルでもアップロードできます（上限200MB。動画より音声のみの方が軽く確実です）。`download_youtube_mac.command` が開けない場合は、`start_mac.command` と同じく `chmod +x` を実行してください。
+ほかの方法で保存した音声・動画ファイルでもアップロードできます（上限1GB。動画より音声のみの方が軽く確実です）。`download_youtube_mac.command` が開けない場合は、`start_mac.command` と同じく `chmod +x` を実行してください。
 
 ## YouTubeの説明会をMac版で処理する（別の方法）
 

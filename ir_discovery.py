@@ -113,16 +113,21 @@ def bookmarklet(app_url, auto_token=""):
         "(()=>{const A=" + repr(app + "/") + ";const T=" + repr(auto_token) + ";"
         "const isM=u=>/\\.(m3u8|mp3|m4a|aac|mp4)(\\?|$)/i.test(u);"
         "const isCap=u=>/caption|subtitle/i.test(u.split('?')[0]);"
-        "const q4=location.hostname==='events.q4inc.com'&&/\\/attendee\\/\\d+/.test(location.pathname);"
         # What the <video>/<audio> element plays counts even without an extension (Q4 replay links have none).
         "const el=[...document.querySelectorAll('video,audio,source')].map(e=>e.currentSrc||e.src||'')"
         ".filter(x=>/^https?:/.test(x));"
         "let u=performance.getEntriesByType('resource').map(e=>e.name).filter(isM).concat(el);u=[...new Set(u)];"
         # Captions (subtitles.m3u8) are never sent as the media.
         "const real=u.filter(x=>!isCap(x));"
-        "if(!q4&&!real.length){alert('音声・動画URLが見つかりません。プレイヤーで再生を開始してから再度クリックしてください。"
-        "プレイヤーが別ドメインの枠内にある場合は、その枠を新しいタブで開いてから実行してください。');return}"
+        # Nothing playing: send the page itself; the app looks for an on-page transcript, Brightcove, Q4, yt-dlp.
         # Prefer what is actually playing; a Q4 page URL is only the fallback (its DVR copy expires).
+        # logmi Finance: copy the whole article the user can see (members' Q&A included) and let them paste it.
+        "if(/(^|\\.)logmi\\.jp$/.test(location.hostname)){"
+        "const t=[...document.querySelectorAll('section[id^=\"s\"]')].map(x=>x.innerText.trim()).filter(Boolean).join('\\n\\n');"
+        "const ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();"
+        "document.execCommand('copy');ta.remove();"
+        "window.open(A+'?media='+encodeURIComponent(location.href)+'&title='+encodeURIComponent(document.title.slice(0,200))"
+        "+'&paste=1'+(T?'&auto='+T:''),'_blank');return}"
         "const p=!real.length?location.href:(real.find(x=>/\\.m3u8/i.test(x)&&!/chunk|segment|\\/seg/i.test(x))"
         "||el.find(x=>!isCap(x))||real.find(x=>/\\.(mp3|m4a|aac)/i.test(x))||real[0]);"
         "window.open(A+'?media='+encodeURIComponent(p)+'&src='+encodeURIComponent(location.href)"

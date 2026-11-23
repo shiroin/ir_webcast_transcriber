@@ -21,6 +21,7 @@ COLUMNS = {
     "Quarterly_Analysis": "transcript_folder",
     "05_決算分析ノート": "note_url",
     "05更新": "note_updated",
+    "05更新日": "note_updated",  # header was renamed from 05更新; accept both
 }
 CACHE_SECONDS = 600
 
@@ -52,7 +53,10 @@ def parse_rows(values):
     if not values:
         return [], {}
     header = [str(x).strip() for x in values[0]]
-    positions = {key: header.index(name) for name, key in COLUMNS.items() if name in header}
+    positions = {}
+    for name, key in COLUMNS.items():
+        if name in header and key not in positions:
+            positions[key] = header.index(name)
     missing = [name for name, key in COLUMNS.items() if key in ("company", "transcript_folder", "note_url")
                and key not in positions]
     if missing:
@@ -108,7 +112,7 @@ def _column_position(key):
         load_companies(force=True)
         positions = st.session_state["company_registry_cache"]["positions"]
     if key not in positions:
-        header = next(name for name, k in COLUMNS.items() if k == key)
+        header = "」または「".join(name for name, k in COLUMNS.items() if k == key)
         raise RuntimeError(f"企業マスターに「{header}」列が見つかりません。")
     return positions[key]
 
