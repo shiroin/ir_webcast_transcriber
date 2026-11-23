@@ -65,6 +65,60 @@ def detect_slides(upload):
         return False
 
 
+def _secret_api_key():
+    try:
+        return str(st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", "")) or "")
+    except Exception:
+        return os.getenv("OPENAI_API_KEY", "")
+
+
+def detect_metadata(fingerprint, files_and_texts, api_key):
+    """Company (master), fiscal period and call date from the two uploads, once per pair of files.
+
+    Results go into the metadata inputs' session keys; values edited by hand afterwards are kept because
+    detection does not run again for the same files. Returns a short report for the page, or None."""
+    if st.session_state.get("merge_detected_for") == fingerprint:
+        return st.session_state.get("merge_detect_report")
+    import company_registry
+    from automation import guess_company_from_document, guess_company_with_ai
+    from analysis_note import extract_call_metadata
+    names = [name for name, _ in files_and_texts]
+    text = "\n\n".join(body[:8000] for _, body in files_and_texts)
+    report, values = [], {}
+    item = None
+    try:
+        companies = company_registry.load_companies()
+        item = guess_company_from_document(companies, names, text)
+        if not item and api_key:
+            item = guess_company_with_ai(api_key, companies, names, text)
+    except Exception as exc:
+        report.append(f"企業の自動判定に失敗: {exc}")
+    if item:
+        values["merge_company"] = item["company"]
+        if str(item.get("transcript_folder", "")).startswith("http"):
+            values["merge_folder"] = item["transcript_folder"]
+        st.session_state["merge_pending_pick"] = company_registry.label(item)
+    if api_key:
+        try:
+            meta = extract_call_metadata(api_key, "gpt-4.1-mini", values.get("merge_company", ""), text,
+                                         "Files: " + " / ".join(names))
+            if meta.get("fiscal_period"):
+                values["merge_period"] = meta["fiscal_period"]
+            if meta.get("event_date"):
+                values["merge_date"] = meta["event_date"]
+            if meta.get("evidence"):
+                report.append("根拠：" + meta["evidence"][:150])
+        except Exception as exc:
+            report.append(f"決算期・説明会日の自動判定に失敗: {exc}")
+    st.session_state["merge_pending_values"] = values
+    head = "自動判定：" + "／".join(f"{label} {values[key]}" for key, label in (
+        ("merge_company", "企業"), ("merge_period", "決算期"), ("merge_date", "説明会日")) if values.get(key))
+    report.insert(0, head if values else "自動判定できませんでした。手で入力してください。")
+    st.session_state["merge_detected_for"] = fingerprint
+    st.session_state["merge_detect_report"] = report
+    return report
+
+
 def build_combined(earnings, followup, metadata):
     """Combine without rewriting either transcript, with explicit source boundaries."""
     def clean(value):
@@ -99,6 +153,11 @@ def main():
     st.subheader("Google Drive接続・保存先設定")
     google_login_panel()
     from automation import master_company_picker
+    if st.session_state.get("merge_pending_pick"):
+        st.session_state["merge_company_pick"] = st.session_state.pop("merge_pending_pick")
+    for key, value in (st.session_state.pop("merge_pending_values", None) or {}).items():
+        # Also the "pref_" shadow kept by workflow_utils.persistent_text.
+        st.session_state[key] = st.session_state["pref_" + key] = value
     master_company_picker("merge_company_pick", {"merge_folder": "transcript_folder", "merge_company": "company"},
                           label="企業（企業マスターから選ぶと保存先フォルダと企業名を自動入力）")
     folder_url=persistent_text("保存先Google DriveフォルダURL", "merge_folder",
@@ -131,6 +190,13 @@ def main():
     f_slides = s2.checkbox("②をスライド資料として文章化", value=detect_slides(followup_file),
                            key="merge_f_slides_" + fingerprint, disabled=not followup_file.name.lower().endswith(".pdf"))
     st.subheader("③ 統合メタデータ")
+    first_detection = st.session_state.get("merge_detected_for") != fingerprint
+    report = detect_metadata(fingerprint, [(earnings_file.name, e_body), (followup_file.name, f_body)],
+                             _secret_api_key())
+    if first_detection and st.session_state.get("merge_pending_values"):
+        st.rerun()  # apply the detected values from the top, where the picker and folder inputs are drawn
+    for line in report or []:
+        st.caption(line)
     a, b = st.columns(2)
     with a:
         company = persistent_text("企業名（必須）", key="merge_company", placeholder="NVIDIA")
