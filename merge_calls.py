@@ -119,6 +119,50 @@ def detect_metadata(fingerprint, files_and_texts, api_key):
     return report
 
 
+def saved_doc_id(folder_url, job_id, title):
+    """ID of a document auto_save_documents created for this job (it keeps them per job and folder)."""
+    try:
+        folder_id = parse_folder_id(folder_url)
+    except ValueError:
+        return None
+    identity = hashlib.sha256((job_id + "\0" + folder_id).encode()).hexdigest()
+    doc_id = (st.session_state.get("autosave_" + identity) or {}).get(title)
+    if not doc_id:
+        found = existing_google_doc(folder_id, title)
+        doc_id = found and found["id"]
+    return doc_id
+
+
+def add_to_note(item, folder_url, job_id, translated_name, translated, period, event_date, model, api_key):
+    """After saving: summarize the Japanese text into 05_決算分析ノート, once per job (retry keeps the summary)."""
+    from automation import run_analysis_step
+    if not item:
+        st.info("05_決算分析ノートに追記するには、上の「企業（企業マスター）」で企業を選んでください。")
+        return
+    script_id = saved_doc_id(folder_url, job_id, translated_name)
+    if not script_id:
+        st.caption("日本語訳の保存が終わると、05_決算分析ノートに追記します。")
+        return
+    note = st.session_state.setdefault("merge_note_" + job_id, {
+        "company": item["company"], "company_row": item, "translated": translated, "model": model})
+    note.update(period=period.strip(), date=event_date.strip(),
+                script_url=f"https://docs.google.com/document/d/{script_id}/edit")
+    if not note.get("done") and not note.get("error"):
+        try:
+            run_analysis_step(note, api_key)
+            if not note.get("done"):
+                note["error"] = "05_決算分析ノートへの追記が完了しませんでした。"
+        except Exception as exc:
+            note["error"] = f"05_決算分析ノートへの追記に失敗しました: {exc}"
+    if note.get("error"):
+        st.error(note["error"])
+        # Clearing the error lets the next run try again; a summary already written is reused.
+        st.button("05_決算分析ノートへの追記を再試行", key="merge_note_retry", on_click=note.pop, args=("error", None))
+    elif note.get("done") and note.get("doc_url"):
+        st.success("05_決算分析ノートへの追記まで完了しました。")
+        st.markdown(f"[05_決算分析ノートを開く]({note['doc_url']})")
+
+
 def build_combined(earnings, followup, metadata):
     """Combine without rewriting either transcript, with explicit source boundaries."""
     def clean(value):
@@ -158,7 +202,7 @@ def main():
     for key, value in (st.session_state.pop("merge_pending_values", None) or {}).items():
         # Also the "pref_" shadow kept by workflow_utils.persistent_text.
         st.session_state[key] = st.session_state["pref_" + key] = value
-    master_company_picker("merge_company_pick", {"merge_folder": "transcript_folder", "merge_company": "company"},
+    picked = master_company_picker("merge_company_pick", {"merge_folder": "transcript_folder", "merge_company": "company"},
                           label="企業（企業マスターから選ぶと保存先フォルダと企業名を自動入力）")
     folder_url=persistent_text("保存先Google DriveフォルダURL", "merge_folder",
         placeholder="https://drive.google.com/drive/u/0/folders/...")
@@ -236,6 +280,9 @@ def main():
                                 min_value=0.0,format="%.4f",key="merge_cached_rate")
 
     slide_model = st.text_input("スライド文章化モデル（画像を読めるモデル）", value="gpt-4.1", key="merge_slide_model")
+    note_enabled = st.checkbox("保存後に、4,000字以上の要約を作って05_決算分析ノートの先頭に追記する", value=True,
+                               key="merge_note_enabled")
+    analysis_model = st.text_input("要約モデル", value="gpt-4.1", key="merge_analysis_model")
     original_header, original_body, _ = split_metadata(combined)
     sources = [
         {"key": "e", "title": "Earnings Call", "file": earnings_file, "body": e_body, "slides": e_slides},
@@ -264,7 +311,8 @@ def main():
         return len(state.get("chunks", {})) == len(src["parts"])
 
     can_translate = bool(api_key and company.strip() and period.strip() and event_date.strip())
-    if st.button("統合全文の日本語化を開始／再開", type="primary", disabled=not can_translate, key="merge_translate_start"):
+    if st.button("日本語化 → 保存 → 05_決算分析ノート追記を開始／再開", type="primary", disabled=not can_translate,
+                 key="merge_translate_start"):
         from pdf_pipeline import narrate_slides
         with st.status("日本語化中…", expanded=True) as status:
             try:
@@ -320,14 +368,18 @@ def main():
         st.download_button("統合日本語訳TXTをダウンロード",
                            translated.encode("utf-8-sig"),
                            file_name=translated_name + ".txt", mime="text/plain")
-    st.subheader("⑤ Google Driveへ自動保存")
+    st.subheader("⑤ Google Driveへ自動保存 → 05_決算分析ノート")
     if complete:
         docs = ((name, combined), (translated_name, translated))
         auto_save_documents(folder_url, docs, job_id)
         if st.button("保存のみ再試行", key="merge_autosave_retry"):
             auto_save_documents(folder_url, docs, job_id, retry=True)
+        if note_enabled:
+            add_to_note(picked, folder_url, job_id, translated_name, translated, period, event_date,
+                        analysis_model, api_key)
     else:
-        st.caption("翻訳完了後、指定したフォルダに原文と日本語訳を自動アップロードします。")
+        st.caption("日本語化が終わると、指定したフォルダに原文と日本語訳を自動アップロードし、"
+                   "続けて05_決算分析ノートに追記します。")
 
 
 if __name__ == "__main__":
