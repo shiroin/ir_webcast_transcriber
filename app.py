@@ -427,6 +427,68 @@ def mostly_japanese(text):
     return bool(sample) and jp / len(sample) > 0.3
 
 
+def _jstream_from_player_html(html):
+    """J-Stream player config (jstream_t3.PlayerFactoryIF.create({b: ".../www50/<publisher>/...", m: base64 id}))
+    -> the "jstream:www50:<publisher>:<id>" URL that yt-dlp's JStream extractor takes."""
+    import base64
+    b = re.search(r"""\bb:\s*["']([^"']+)["']""", html)
+    m = re.search(r"""\bm:\s*["']([^"']+)["']""", html)
+    if not (b and m):
+        return ""
+    server = re.search(r"/(www\d+)/([a-z0-9]+)/", "/" + b.group(1))
+    try:
+        mid = base64.b64decode(m.group(1)).decode().strip()
+    except Exception:
+        return ""
+    return f"jstream:{server.group(1)}:{server.group(2)}:{mid}" if server and mid.isdigit() else ""
+
+
+def jstream_videos(page_url):
+    """J-Stream videos on an IR page, in page order (newest first on most IR pages), including ones that open in a
+    pop-up (<a data-url="https://api01-platform.stream.co.jp/apiservice/plt3/...">, e.g. rohm.co.jp).
+    Each item: {"jstream", "title", "player", "qa_pdf"}; qa_pdf is a Q&A PDF listed next to the video."""
+    host = (urlparse(page_url).hostname or "").lower()
+    found = []
+    try:
+        if host.endswith(("stream.co.jp", "stream.ne.jp")):
+            found.append((page_url, None))
+        else:
+            html = fetch_html(page_url).text
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup.find_all(["a", "button", "div", "span", "iframe", "li"]):
+                for attr in ("data-url", "data-src", "href", "src", "data-video"):
+                    value = tag.get(attr) or ""
+                    if "stream.co.jp/apiservice/" in value and value not in [u for u, _ in found]:
+                        found.append((urljoin(page_url, value), tag))
+            if not found and "PlayerFactoryIF" in html:
+                inline = _jstream_from_player_html(html)
+                if inline:
+                    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+                    return [{"jstream": inline, "title": title, "player": page_url, "qa_pdf": ""}]
+    except Exception:
+        return []
+    videos = []
+    for player, tag in found[:10]:
+        try:
+            html = fetch_html(player).text
+        except Exception:
+            continue
+        target = _jstream_from_player_html(html)
+        if not target:
+            continue
+        title = re.search(r"<title>(.*?)</title>", html, re.S)
+        qa_pdf = ""
+        group = tag.find_parent(["ul", "ol", "table", "section"]) if tag is not None else None
+        for a in (group.find_all("a", href=True) if group is not None else []):
+            label = a.get_text(" ", strip=True)
+            if a["href"].lower().split("?")[0].endswith(".pdf") and re.search(r"Q\s*&\s*A|質疑|ＱＡ|Ｑ＆Ａ", label, re.I):
+                qa_pdf = urljoin(page_url, a["href"])
+                break
+        videos.append({"jstream": target, "title": title.group(1).strip() if title else "", "player": player,
+                       "qa_pdf": qa_pdf})
+    return videos
+
+
 def brightcove_player_url(page_url):
     """Brightcove player URL for a page that embeds <video data-video-id data-account> (e.g. group.softbank).
 
@@ -458,7 +520,7 @@ def yt_dlp_generic_audio_get(url, out_path, referer=None):
     if referer:
         cmd += ["--referer", referer]
     # Lowest-bitrate audio track is plenty for speech; the transcription chunks are 32 kbps anyway.
-    cmd += ["-f", "ba[abr<=100]/ba/b", "-x", "--audio-format", "mp3", "--audio-quality", "64K",
+    cmd += ["-f", "ba[abr<=100]/ba/worst", "-x", "--audio-format", "mp3", "--audio-quality", "64K",
             "--print", "before_dl:%(title)s", "--no-simulate", "-o", template, url]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
@@ -1831,12 +1893,34 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                 status.info("IR Webcasting / SmartVision / IRページ内の音声URLを探索中…")
                 candidates = []
                 published = page_transcript(url)
-                brightcove = "" if published else brightcove_player_url(url)
+                jstream = [] if published else jstream_videos(url)
+                brightcove = "" if (published or jstream) else brightcove_player_url(url)
                 if published:
                     # An official transcript on the page beats speech recognition: no audio, no transcription cost.
                     direct_caption_text = published
                     source = "IRページ掲載の公式書き起こし"
                     st.caption(f"IRページに書き起こし全文（{len(published):,}文字）が掲載されているため、音声ではなくこれを原文に使います。")
+                elif jstream and yt_dlp_available():
+                    video = jstream[0]
+                    status.info(f"J-Streamの動画を検出：{video['title']}。音声を取得中…")
+                    if len(jstream) > 1:
+                        st.caption(f"ページには動画が{len(jstream)}本あり、一番上の「{video['title']}」を使います。"
+                                   "別の動画を使う場合は、その動画を再生してブックマークレットを押してください。")
+                    audio, media_title = yt_dlp_generic_audio_get(video["jstream"], audio, referer=url)
+                    media_title = media_title or video["title"]
+                    source = "J-Stream"
+                    if video.get("qa_pdf") and not extra_text:
+                        # The Q&A is often a PDF listed next to the video: attach it as the Q&A part.
+                        try:
+                            import fitz
+                            from pdf_pipeline import fetch_pdf
+                            qa_data, qa_name = fetch_pdf(video["qa_pdf"])
+                            with fitz.open(stream=qa_data, filetype="pdf") as qa_doc:
+                                extra_text = "\n\n".join(page.get_text("text", sort=True).strip() for page in qa_doc).strip()
+                            extra_label = qa_name
+                            st.caption(f"動画の隣にある質疑応答のPDF（{qa_name}）も取り込みます。")
+                        except Exception as exc:
+                            st.caption(f"質疑応答のPDFを取り込めませんでした（動画だけで進めます）: {exc}")
                 elif brightcove and yt_dlp_available():
                     status.info("Brightcoveの動画を検出。音声のみを取得中…")
                     audio, media_title = yt_dlp_generic_audio_get(brightcove, audio, referer=url)
@@ -1844,7 +1928,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                 else:
                     nested_candidates, player_pages = discover_nested_player_media(url, max_depth=2)
                     candidates = nested_candidates or discover_media(url)
-                if not published and not brightcove and not candidates and yt_dlp_available():
+                if not published and not jstream and not brightcove and not candidates and yt_dlp_available():
                     # yt-dlp knows many embedded players: try the page itself, then real player iframes.
                     players = [p for p in player_pages if not any(x in p.lower() for x in NOT_PLAYERS)]
                     last_player_error = None
@@ -1863,7 +1947,7 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                         st.info("プレイヤーで再生を開始してから、ブックマークレットで音声URLを取得してください。"
                                 "サイトがこのサーバーからのアクセスを拒否している場合は、Mac版で処理してください。")
                         st.stop()
-                elif not published and not brightcove and not candidates:
+                elif not published and not jstream and not brightcove and not candidates:
                     st.error("自動検出できませんでした。JavaScript / Cookie / 認証型の可能性があります。")
                     st.info("この場合だけDevToolsのNetworkから m3u8 / mp3 / mp4 / ts を取得して貼ってください。")
                     st.stop()
