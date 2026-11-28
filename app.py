@@ -1,4 +1,5 @@
 import os
+import json
 import re
 import sys
 import shutil
@@ -489,6 +490,63 @@ def jstream_videos(page_url):
     return videos
 
 
+def is_chotline(url):
+    host = (urlparse(url).hostname or "").lower()
+    return host == "c-hotline.net" or host.endswith(".c-hotline.net")
+
+
+def chotline_media(page_url):
+    """Company Hotline (c-hotline.net) on-demand conference -> {"url", "title", "text"}.
+
+    The viewer page (/Viewer/Default/<id>) frames /docs/co/arc/<code>/, whose player reads ../project.json:
+    {"audio": ".\\src\\media\\x.mp3"} or {"video": ...} (Windows-style paths, relative to <code>/)."""
+    path = urlparse(page_url).path
+    m = re.search(r"(/docs/co/[^/]+/[^/]+/)", path)
+    if m:
+        base = urljoin(page_url, m.group(1))
+    else:
+        soup = BeautifulSoup(fetch_html(page_url).text, "html.parser")
+        frame = soup.find("iframe", id="ifrm_conf_body") or next(
+            (f for f in soup.find_all("iframe") if "/docs/co/" in (f.get("src") or "")), None)
+        if frame is None:
+            raise RuntimeError("Company Hotlineのページから説明会のプレイヤーが見つかりませんでした。"
+                               "ライブ配信前・会員限定の可能性があります。")
+        base = urljoin(page_url, frame["src"])
+        sub = re.search(r"(/docs/co/[^/]+/[^/]+/)", urlparse(base).path)
+        base = urljoin(base, sub.group(1)) if sub else base.rsplit("/", 1)[0] + "/"
+    r = requests.get(urljoin(base, "project.json"), headers={"User-Agent": UA, "Referer": base}, timeout=20)
+    r.raise_for_status()
+    meta = r.json()
+
+    def resolve(value):
+        value = (value or "").strip().replace("\\", "/")
+        if not value:
+            return ""
+        return value if value.startswith("http") else urljoin(base, value.lstrip("./"))
+
+    media = resolve(meta.get("audio")) or resolve(meta.get("video"))
+    if not media:
+        raise RuntimeError("Company Hotlineの説明会に音声・動画が登録されていません（公開前の可能性があります）。")
+    text = ""
+    if meta.get("text"):
+        # Slide-synced script ("<s1>...<s2>..."), when the company published one.
+        try:
+            raw = requests.get(resolve(meta["text"]), headers={"User-Agent": UA, "Referer": base}, timeout=20).text
+            text = "\n\n".join(part.strip() for part in re.split(r"<s\d+>", raw) if part.strip())
+        except Exception:
+            text = ""
+    title = " ".join(x for x in (meta.get("companyName"), meta.get("presentationTitle")) if x)
+    company = re.sub(r"^\s*(株式会社|\(株\)|（株）)\s*|\s*(株式会社|\(株\)|（株）)\s*$", "", meta.get("companyName") or "").strip()
+    # Handouts are usually named <company><YYMMDD>_n.pdf (e.g. resonac261111_1.pdf) = the presentation date.
+    footer = json.dumps(meta.get("player") or {}, ensure_ascii=False)
+    day = re.search(r"[a-z_-](\d{2})(\d{2})(\d{2})(?:_\d+)?\.pdf", footer, re.I)
+    date = ""
+    if day and 1 <= int(day.group(2)) <= 12 and 1 <= int(day.group(3)) <= 31:
+        date = f"20{day.group(1)}-{day.group(2)}-{day.group(3)}"
+    return {"url": media, "title": title, "text": text, "company": company,
+            "period": (meta.get("presentationTitle") or "").replace("決算説明会", "").strip(), "date": date}
+
+
 def brightcove_player_url(page_url):
     """Brightcove player URL for a page that embeds <video data-video-id data-account> (e.g. group.softbank).
 
@@ -679,6 +737,71 @@ def ffmpeg_hls_args():
     return _HLS_PICKY_FLAG
 
 
+def hls_parallel_get(url, out_path, referer=None, workers=8):
+    """Plain-TS HLS: download the segments in parallel, join them, then transcode the local file.
+
+    Some CDNs (e.g. Qumu) answer each segment quickly but ffmpeg fetches them one by one with new
+    connections, so a 30-minute call took 20+ minutes. Encrypted / fMP4 playlists are left to ffmpeg."""
+    import concurrent.futures
+    import threading
+    headers = {"User-Agent": UA, "Referer": referer or url}
+    playlist = requests.get(url, headers=headers, timeout=20)
+    playlist.raise_for_status()
+    text = playlist.text
+    if "#EXT-X-STREAM-INF" in text:
+        # Master playlist: the lowest-bandwidth variant carries the same audio.
+        variants, bw = [], None
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("#EXT-X-STREAM-INF"):
+                m = re.search(r"BANDWIDTH=(\d+)", line)
+                bw = int(m.group(1)) if m else 10 ** 12
+            elif line and not line.startswith("#") and bw is not None:
+                variants.append((bw, urljoin(playlist.url, line)))
+                bw = None
+        if not variants or "TYPE=AUDIO" in text:
+            raise RuntimeError("variant playlist not supported")
+        return hls_parallel_get(min(variants)[1], out_path, referer=referer or url, workers=workers)
+    if "#EXT-X-MAP" in text or re.search(r"#EXT-X-KEY:(?!.*METHOD=NONE)", text) or "#EXT-X-ENDLIST" not in text:
+        raise RuntimeError("fMP4 / encrypted / live playlist")
+    segments = [urljoin(playlist.url, line.strip()) for line in text.splitlines()
+                if line.strip() and not line.startswith("#")]
+    if not segments:
+        raise RuntimeError("no segments")
+    local = threading.local()
+
+    def fetch(item):
+        index, seg = item
+        session = getattr(local, "session", None) or requests.Session()
+        local.session = session
+        for attempt in range(4):
+            try:
+                r = session.get(seg, headers=headers, timeout=(15, 60))
+                r.raise_for_status()
+                return index, r.content
+            except Exception:
+                if attempt == 3:
+                    raise
+    joined = out_path.with_suffix(".source.ts")
+    parts = [None] * len(segments)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for index, data in pool.map(fetch, enumerate(segments)):
+            parts[index] = data
+    with joined.open("wb") as f:
+        for data in parts:
+            f.write(data)
+    parts = None
+    try:
+        subprocess.run(["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error", "-i", str(joined),
+                        "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "32k",
+                        str(out_path)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
+    finally:
+        joined.unlink(missing_ok=True)
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        raise RuntimeError("empty audio")
+    return out_path
+
+
 def ffmpeg_get(url, out_path):
     """Stream audio from remote media; never load a large MP4 into Python RAM.
 
@@ -697,6 +820,11 @@ def ffmpeg_get(url, out_path):
         "-c:a", "libmp3lame", "-b:a", "32k", str(out_path),
     ]
     is_hls = parsed.path.lower().endswith(".m3u8")
+    if is_hls:
+        try:
+            return hls_parallel_get(url, out_path)
+        except Exception:
+            out_path.unlink(missing_ok=True)  # ffmpeg / yt-dlp below handle the rest
     direct = ffmpeg_base + [
         "-rw_timeout", "30000000", "-user_agent", UA,
         "-headers", f"Referer: {parsed.scheme}://{parsed.netloc}/\r\n",
@@ -900,6 +1028,17 @@ def transcode_uploaded_audio(upload, out_path):
     finally:
         source.unlink(missing_ok=True)
 
+def vimeo_player_url(url):
+    """vimeo.com/<id>[/<hash>] or ?h=<hash> -> https://player.vimeo.com/video/<id>[?h=<hash>]."""
+    from urllib.parse import parse_qs
+    parsed = urlparse(url)
+    m = re.search(r"(?:^|/)(?:video/)?(\d{6,})(?:/([0-9a-f]{6,}))?(?:/|$)", parsed.path)
+    if not m:
+        return ""
+    h = m.group(2) or (parse_qs(parsed.query).get("h") or [""])[0]
+    return f"https://player.vimeo.com/video/{m.group(1)}" + (f"?h={h}" if h else "")
+
+
 def vimeo_audio_get(url, out_path):
     """Vimeo専用。
 
@@ -912,19 +1051,38 @@ def vimeo_audio_get(url, out_path):
     work.mkdir(exist_ok=True)
     template = str(work / "source.%(ext)s")
 
-    cmd = [
-        sys.executable, "-m", "yt_dlp",
-        "--no-playlist",
-        "--downloader", "http:native",
-        "--downloader", "dash,m3u8:native",
-        "--retries", "5",
-        "--fragment-retries", "10",
-        "--abort-on-unavailable-fragments",
-        "-f", "bestaudio/best",
-        "-o", template,
-        url,
-    ]
-    run(cmd)
+    def yt_dlp_cmd(target, impersonate):
+        return [
+            sys.executable, "-m", "yt_dlp",
+            "--no-playlist",
+            *(["--impersonate", "chrome"] if impersonate else []),
+            "--downloader", "http:native",
+            "--downloader", "dash,m3u8:native",
+            "--retries", "5",
+            "--fragment-retries", "10",
+            "--abort-on-unavailable-fragments",
+            "-f", "bestaudio/worst",
+            "-o", template,
+            target,
+        ]
+
+    try:
+        import curl_cffi  # noqa: F401
+        can_impersonate = True
+    except Exception:
+        can_impersonate = False
+    errors = []
+    for target in [x for x in (vimeo_player_url(url), url) if x]:
+        try:
+            run(yt_dlp_cmd(target, can_impersonate))
+            break
+        except Exception as exc:
+            errors.append(str(exc)[-400:])
+            for leftover in work.iterdir():
+                leftover.unlink(missing_ok=True)
+    else:
+        hint = "" if can_impersonate else "（curl_cffi が未インストールです。requirements.txt を更新してください）"
+        raise RuntimeError("Vimeoから取得できませんでした" + hint + "：" + " / ".join(errors))
 
     # yt-dlpが作成した完成済みファイルのみを対象にする。
     files = [x for x in work.iterdir() if x.is_file() and not x.name.endswith((".part", ".ytdl"))]
@@ -1626,6 +1784,13 @@ elif url.strip() and is_irwebcasting(url.strip()):
         st.caption("IR Webcastingを検出：企業名・決算期・説明会日を自動取得します。")
     except Exception as e:
         st.caption(f"IR Webcastingのタグ自動取得に失敗しました（手入力は可能です）: {e}")
+elif url.strip() and is_chotline(url.strip()) and not kind(url):
+    try:
+        _chot = chotline_media(url.strip())
+        auto_meta = {"company": _chot["company"], "period": _chot["period"], "date": _chot["date"]}
+        st.caption("Company Hotlineを検出：企業名・決算期・説明会日を自動取得しました（必要なら修正できます）。")
+    except Exception as e:
+        st.caption(f"Company Hotlineの情報を取得できませんでした（手入力は可能です）: {e}")
 elif url.strip() and (kind(url) or q4_meeting_id(url) or is_q4_recording_link(url)):
     pass  # Direct media / Q4 replay: no HTML page to read (and never download the media here).
 elif url.strip():
@@ -1855,6 +2020,19 @@ if st.button("文字起こし開始", type="primary", use_container_width=True) 
                 st.caption(f"音声・動画: {q4_media['url']}")
                 audio = q4_replay_audio_get(q4_media["url"], audio)
                 source = "Captions URL → " + ("Q4 event replay" if q4_media["recording_started_at"] else "HLS")
+            elif is_chotline(url):
+                status.info("Company Hotlineの説明会を検出。音声の場所を取得中…")
+                chot = chotline_media(url)
+                media_title = chot["title"]
+                if len(chot["text"]) > 2000:
+                    # A published script beats speech recognition.
+                    direct_caption_text = chot["text"]
+                    source = "Company Hotline（掲載の書き起こし）"
+                else:
+                    st.caption(f"{chot['title']}：{chot['url']}")
+                    status.info("Company Hotlineから音声取得中…")
+                    audio = ffmpeg_get(chot["url"], audio)
+                    source = "Company Hotline"
             elif is_youtube(url):
                 status.info("YouTubeから音声取得中…")
                 audio = yt_dlp_audio_get(url, audio)
